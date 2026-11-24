@@ -1,7 +1,7 @@
+use rusqlite::{params, Connection, OptionalExtension, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use rusqlite::{params, Connection, Result};
 
 use crate::library::Track;
 
@@ -22,7 +22,7 @@ pub struct DbStats {
 
 impl LibraryDb {
     pub fn open_default() -> Result<Self> {
-        let db_dir = dirs_or_local();
+        let db_dir = crate::library::data_dir();
         let db_path = db_dir.join("kanono_x_library.db");
         Self::open(&db_path)
     }
@@ -47,6 +47,10 @@ impl LibraryDb {
                 file_path TEXT,
                 is_stream INTEGER NOT NULL,
                 stream_url TEXT,
+                support_url TEXT,
+                track_number INTEGER,
+                bitrate INTEGER,
+                sample_rate INTEGER,
                 play_count INTEGER DEFAULT 0,
                 last_played INTEGER,
                 added_at INTEGER NOT NULL
@@ -69,10 +73,36 @@ impl LibraryDb {
             ",
         )?;
 
+        for (name, definition) in [
+            ("support_url", "TEXT"),
+            ("track_number", "INTEGER"),
+            ("bitrate", "INTEGER"),
+            ("sample_rate", "INTEGER"),
+        ] {
+            Self::ensure_column(&conn, name, definition)?;
+        }
+
         Ok(Self {
             conn,
             db_path: path.to_path_buf(),
         })
+    }
+
+    fn ensure_column(conn: &Connection, name: &str, definition: &str) -> Result<()> {
+        let exists: Option<String> = conn
+            .query_row(
+                "SELECT name FROM pragma_table_info('tracks') WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            conn.execute(
+                &format!("ALTER TABLE tracks ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn upsert_track(&mut self, track: &Track) -> Result<()> {
@@ -82,8 +112,8 @@ impl LibraryDb {
             .as_secs() as i64;
 
         self.conn.execute(
-            "INSERT INTO tracks (id, title, artist, album, duration, file_path, is_stream, stream_url, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO tracks (id, title, artist, album, duration, file_path, is_stream, stream_url, support_url, track_number, bitrate, sample_rate, added_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                  title = excluded.title,
                  artist = excluded.artist,
@@ -91,7 +121,11 @@ impl LibraryDb {
                  duration = excluded.duration,
                  file_path = excluded.file_path,
                  is_stream = excluded.is_stream,
-                 stream_url = excluded.stream_url",
+                 stream_url = excluded.stream_url,
+                 support_url = excluded.support_url,
+                 track_number = excluded.track_number,
+                 bitrate = excluded.bitrate,
+                 sample_rate = excluded.sample_rate",
             params![
                 track.id,
                 track.title,
@@ -101,6 +135,10 @@ impl LibraryDb {
                 track.file_path,
                 if track.is_stream { 1 } else { 0 },
                 track.stream_url,
+                track.support_url,
+                track.track_number,
+                track.bitrate,
+                track.sample_rate,
                 now,
             ],
         )?;
@@ -118,8 +156,8 @@ impl LibraryDb {
 
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO tracks (id, title, artist, album, duration, file_path, is_stream, stream_url, added_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO tracks (id, title, artist, album, duration, file_path, is_stream, stream_url, support_url, track_number, bitrate, sample_rate, added_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      artist = excluded.artist,
@@ -127,7 +165,11 @@ impl LibraryDb {
                      duration = excluded.duration,
                      file_path = excluded.file_path,
                      is_stream = excluded.is_stream,
-                     stream_url = excluded.stream_url",
+                     stream_url = excluded.stream_url,
+                     support_url = excluded.support_url,
+                     track_number = excluded.track_number,
+                     bitrate = excluded.bitrate,
+                     sample_rate = excluded.sample_rate",
             )?;
 
             for track in tracks {
@@ -140,6 +182,10 @@ impl LibraryDb {
                     track.file_path,
                     if track.is_stream { 1 } else { 0 },
                     track.stream_url,
+                    track.support_url,
+                    track.track_number,
+                    track.bitrate,
+                    track.sample_rate,
                     now,
                 ])?;
                 inserted += 1;
@@ -152,7 +198,7 @@ impl LibraryDb {
 
     pub fn load_all_tracks(&self) -> Result<Vec<Track>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, artist, album, duration, file_path, is_stream, stream_url FROM tracks ORDER BY rowid ASC",
+            "SELECT id, title, artist, album, duration, file_path, is_stream, stream_url, support_url, track_number, bitrate, sample_rate FROM tracks ORDER BY rowid ASC",
         )?;
 
         let track_iter = stmt.query_map([], |row| {
@@ -166,6 +212,10 @@ impl LibraryDb {
                 file_path: row.get(5)?,
                 is_stream: is_stream_num != 0,
                 stream_url: row.get(7)?,
+                support_url: row.get(8)?,
+                track_number: row.get(9)?,
+                bitrate: row.get(10)?,
+                sample_rate: row.get(11)?,
             })
         })?;
 
@@ -180,7 +230,8 @@ impl LibraryDb {
     }
 
     pub fn delete_track(&mut self, track_id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM tracks WHERE id = ?1", params![track_id])?;
+        self.conn
+            .execute("DELETE FROM tracks WHERE id = ?1", params![track_id])?;
         Ok(())
     }
 
@@ -217,20 +268,11 @@ impl LibraryDb {
     }
 
     pub fn remove_folder(&mut self, folder: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM library_folders WHERE path = ?1", params![folder])?;
+        self.conn.execute(
+            "DELETE FROM library_folders WHERE path = ?1",
+            params![folder],
+        )?;
         Ok(())
-    }
-
-    pub fn load_saved_folders(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT path FROM library_folders ORDER BY added_at ASC")?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
-        let mut folders = Vec::new();
-        for r in rows {
-            if let Ok(f) = r {
-                folders.push(f);
-            }
-        }
-        Ok(folders)
     }
 
     pub fn get_stats(&self) -> DbStats {
@@ -241,7 +283,9 @@ impl LibraryDb {
 
         let total_artists: usize = self
             .conn
-            .query_row("SELECT COUNT(DISTINCT artist) FROM tracks", [], |r| r.get(0))
+            .query_row("SELECT COUNT(DISTINCT artist) FROM tracks", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
 
         let total_albums: usize = self
@@ -251,17 +295,19 @@ impl LibraryDb {
 
         let total_duration_secs: f32 = self
             .conn
-            .query_row("SELECT COALESCE(SUM(duration), 0.0) FROM tracks", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(SUM(duration), 0.0) FROM tracks", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0.0);
 
         let total_plays: u64 = self
             .conn
-            .query_row("SELECT COALESCE(SUM(play_count), 0) FROM tracks", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(SUM(play_count), 0) FROM tracks", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
 
-        let db_file_size_bytes = fs::metadata(&self.db_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let db_file_size_bytes = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
 
         DbStats {
             total_tracks,
@@ -289,17 +335,11 @@ impl LibraryDb {
 
     pub fn get_setting(&self, key: &str) -> Option<String> {
         self.conn
-            .query_row("SELECT value FROM app_settings WHERE key = ?1", params![key], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
             .ok()
     }
-}
-
-fn dirs_or_local() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        let p = PathBuf::from(home).join(".local/share/kanono-x");
-        if fs::create_dir_all(&p).is_ok() {
-            return p;
-        }
-    }
-    PathBuf::from(".")
 }

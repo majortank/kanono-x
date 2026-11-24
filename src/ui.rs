@@ -4,17 +4,18 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 use crate::audio::{AudioEngine, RepeatMode};
+use crate::audius::{self, AudiusItem};
 use crate::folder_tree::{FolderHierarchy, FolderTreeNode};
 use crate::library::{format_time, scan_directory, Track};
 use crate::library_db::{DbStats, LibraryDb};
+use crate::providers::{self, Provider, ProviderItem};
 use crate::theme::{PlayerTheme, ThemePalette};
-use crate::youtube::{download_and_convert_mp3, prepare_stream_cache, search_or_resolve, YouTubeItem};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewTab {
     NowPlaying,
     Library,
-    YouTubeConverter,
+    Discover,
     Settings,
 }
 
@@ -72,10 +73,15 @@ pub enum SidebarMode {
 }
 
 pub enum BgTaskMsg {
-    SearchComplete(Result<Vec<YouTubeItem>, String>),
-    ConvertComplete(Result<Track, String>),
+    SearchComplete(Result<DiscoverResults, String>),
+    DownloadComplete(Result<Track, String>),
     StreamComplete(Result<Track, String>),
     Scanned(Vec<Track>, String),
+}
+
+pub enum DiscoverResults {
+    Audius(Vec<AudiusItem>),
+    Provider(Vec<ProviderItem>),
 }
 
 pub struct KanonoApp {
@@ -103,23 +109,24 @@ pub struct KanonoApp {
     pub sort_key: SortKey,
     pub sort_desc: bool,
     pub queue: Vec<Track>,
-    pub selected_track_id: Option<String>,
 
     pub scanning: usize,
     pub saved: crate::library::SavedLibrary,
-    pub yt_search_input: String,
-    pub yt_results: Vec<YouTubeItem>,
-    pub yt_is_searching: bool,
-    pub yt_is_converting: bool,
-    pub yt_status_message: String,
-    pub converted_history: Vec<Track>,
+    pub provider_search_input: String,
+    pub providers: Vec<Provider>,
+    pub active_provider: Option<usize>,
+    pub audius_results: Vec<AudiusItem>,
+    pub provider_results: Vec<ProviderItem>,
+    pub discover_is_searching: bool,
+    pub discover_is_downloading: bool,
+    pub discover_status_message: String,
+    pub downloaded_history: Vec<Track>,
+    pub provider_config_error: Option<String>,
 
     // Channels for background tasks
     pub bg_sender: Sender<BgTaskMsg>,
     pub bg_receiver: Receiver<BgTaskMsg>,
 
-    // Demo tracks and library paths
-    pub demo_dir: PathBuf,
     pub library_dir: PathBuf,
 
     // Visualizer state
@@ -136,12 +143,17 @@ pub struct KanonoApp {
 
 impl KanonoApp {
     pub fn new(screenshot_path: Option<String>) -> Self {
-        let (demo_dir, library_dir) = crate::library::ensure_library_dirs();
+        let library_dir = crate::library::ensure_library_dir();
         let (bg_sender, bg_receiver) = channel();
+        let (providers, provider_config_error) = match providers::load_configured_providers() {
+            Ok(providers) => (providers, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
 
         // Open SQLite Database
         let mut db = LibraryDb::open_default().unwrap_or_else(|_| {
-            LibraryDb::open(&PathBuf::from("kanono_x_library.db")).expect("Failed to open SQLite database")
+            LibraryDb::open(&crate::library::data_dir().join("kanono_x_library.db"))
+                .expect("Failed to open SQLite database")
         });
 
         // Load saved theme from SQLite if available
@@ -198,21 +210,23 @@ impl KanonoApp {
             sort_key: SortKey::Added,
             sort_desc: false,
             queue: Vec::new(),
-            selected_track_id: None,
 
             scanning: 0,
             saved: saved_folders,
-            yt_search_input: String::new(),
-            yt_results: Vec::new(),
-            yt_is_searching: false,
-            yt_is_converting: false,
-            yt_status_message: "Ready to stream or convert YouTube music.".to_string(),
-            converted_history: Vec::new(),
+            provider_search_input: String::new(),
+            providers,
+            active_provider: None,
+            audius_results: Vec::new(),
+            provider_results: Vec::new(),
+            discover_is_searching: false,
+            discover_is_downloading: false,
+            discover_status_message: "Ready to search Audius or a configured provider.".to_string(),
+            downloaded_history: Vec::new(),
+            provider_config_error,
 
             bg_sender,
             bg_receiver,
 
-            demo_dir,
             library_dir,
 
             visualizer_phase: 0.0,
@@ -237,7 +251,7 @@ impl KanonoApp {
     }
 
     pub fn load_initial_tracks(&mut self) {
-        let mut dirs = vec![self.demo_dir.clone(), self.library_dir.clone()];
+        let mut dirs = vec![self.library_dir.clone()];
         dirs.extend(self.saved.folders.iter().map(PathBuf::from));
         let files: Vec<PathBuf> = self.saved.files.iter().map(PathBuf::from).collect();
         self.start_scan(dirs, files, "Library refreshed".to_string());
@@ -293,8 +307,17 @@ impl KanonoApp {
     }
 
     pub fn rescan_library(&mut self) {
-        let cur_id = self.current_index.and_then(|i| self.playlist.get(i)).map(|t| t.id.clone());
-        self.playlist.retain(|t| t.is_stream || t.file_path.as_ref().map(|p| Path::new(p).exists()).unwrap_or(false));
+        let cur_id = self
+            .current_index
+            .and_then(|i| self.playlist.get(i))
+            .map(|t| t.id.clone());
+        self.playlist.retain(|t| {
+            t.is_stream
+                || t.file_path
+                    .as_ref()
+                    .map(|p| Path::new(p).exists())
+                    .unwrap_or(false)
+        });
         self.current_index = cur_id.and_then(|id| self.playlist.iter().position(|t| t.id == id));
         self.load_initial_tracks();
     }
@@ -451,59 +474,96 @@ impl KanonoApp {
 
     pub fn set_theme(&mut self, theme: PlayerTheme) {
         self.current_theme = theme;
-        let _ = self.db.set_setting("theme", match theme {
-            PlayerTheme::CrtGreen => "CrtGreen",
-            PlayerTheme::CrtAmber => "CrtAmber",
-            PlayerTheme::CrtCyan => "CrtCyan",
-            PlayerTheme::OmarchyEmerald => "OmarchyEmerald",
-            PlayerTheme::OmarchyCyberpunk => "OmarchyCyberpunk",
-            PlayerTheme::OmarchyNord => "OmarchyNord",
-            PlayerTheme::OmarchyDracula => "OmarchyDracula",
-            PlayerTheme::SolarizedLight => "SolarizedLight",
-        });
+        let _ = self.db.set_setting(
+            "theme",
+            match theme {
+                PlayerTheme::CrtGreen => "CrtGreen",
+                PlayerTheme::CrtAmber => "CrtAmber",
+                PlayerTheme::CrtCyan => "CrtCyan",
+                PlayerTheme::OmarchyEmerald => "OmarchyEmerald",
+                PlayerTheme::OmarchyCyberpunk => "OmarchyCyberpunk",
+                PlayerTheme::OmarchyNord => "OmarchyNord",
+                PlayerTheme::OmarchyDracula => "OmarchyDracula",
+                PlayerTheme::SolarizedLight => "SolarizedLight",
+            },
+        );
     }
 
-    pub fn start_yt_search(&mut self) {
-        let query = self.yt_search_input.trim().to_string();
+    pub fn start_discover_search(&mut self) {
+        let query = self.provider_search_input.trim().to_string();
         if query.is_empty() {
             return;
         }
 
-        self.yt_is_searching = true;
-        self.yt_status_message = format!("Searching YouTube for '{}'...", query);
+        self.discover_is_searching = true;
+        self.discover_status_message = format!("Searching for '{}'...", query);
 
         let sender = self.bg_sender.clone();
+        let provider = self
+            .active_provider
+            .and_then(|index| self.providers.get(index).cloned());
         thread::spawn(move || {
-            let res = search_or_resolve(&query);
+            let res = provider
+                .map(|provider| providers::search(&provider, &query).map(DiscoverResults::Provider))
+                .unwrap_or_else(|| audius::search(&query).map(DiscoverResults::Audius));
             let _ = sender.send(BgTaskMsg::SearchComplete(res));
         });
     }
 
-    pub fn start_yt_convert(&mut self, item: YouTubeItem) {
-        self.yt_is_converting = true;
-        self.yt_status_message = format!("Converting '{}' to MP3...", item.title);
-        self.show_toast(format!("Converting: {}", item.title));
+    pub fn start_audius_download(&mut self, item: AudiusItem) {
+        if !item.is_downloadable {
+            return;
+        }
+        self.discover_is_downloading = true;
+        self.discover_status_message =
+            format!("Downloading '{}' to your music library...", item.title);
+        self.show_toast(format!("Downloading: {}", item.title));
 
         let sender = self.bg_sender.clone();
-        let target_dir = self.library_dir.clone();
-        let url = item.url.clone();
+        let library_dir = self.library_dir.clone();
 
         thread::spawn(move || {
-            let res = download_and_convert_mp3(&url, &target_dir);
-            let _ = sender.send(BgTaskMsg::ConvertComplete(res));
+            let res = audius::download_to_library(&item, &library_dir);
+            let _ = sender.send(BgTaskMsg::DownloadComplete(res));
         });
     }
 
-    pub fn start_yt_stream(&mut self, item: YouTubeItem) {
-        self.yt_status_message = format!("Connecting to stream for '{}' (supporting artist)...", item.title);
+    pub fn start_audius_stream(&mut self, item: AudiusItem) {
+        self.discover_status_message = format!("Connecting to Audius for '{}'...", item.title);
         self.show_toast(format!("Connecting stream: {}", item.title));
 
         let sender = self.bg_sender.clone();
-        let url = item.url.clone();
 
         thread::spawn(move || {
-            let res = prepare_stream_cache(&url);
+            let res = audius::stream_to_cache(&item);
             let _ = sender.send(BgTaskMsg::StreamComplete(res));
+        });
+    }
+
+    pub fn start_provider_stream(&mut self, provider: Provider, item: ProviderItem) {
+        self.discover_status_message =
+            format!("Connecting to {} for '{}'...", provider.name, item.title);
+        self.show_toast(format!("Connecting stream: {}", item.title));
+        let sender = self.bg_sender.clone();
+        thread::spawn(move || {
+            let res = providers::stream(&provider, &item);
+            let _ = sender.send(BgTaskMsg::StreamComplete(res));
+        });
+    }
+
+    pub fn start_provider_download(&mut self, provider: Provider, item: ProviderItem) {
+        if !item.downloadable {
+            return;
+        }
+        self.discover_is_downloading = true;
+        self.discover_status_message =
+            format!("Downloading '{}' to your music library...", item.title);
+        self.show_toast(format!("Downloading: {}", item.title));
+        let sender = self.bg_sender.clone();
+        let library_dir = self.library_dir.clone();
+        thread::spawn(move || {
+            let res = providers::download(&provider, &item, &library_dir);
+            let _ = sender.send(BgTaskMsg::DownloadComplete(res));
         });
     }
 
@@ -512,51 +572,61 @@ impl KanonoApp {
             match msg {
                 BgTaskMsg::Scanned(tracks, label) => self.finish_scan(tracks, label),
                 BgTaskMsg::SearchComplete(res) => {
-                    self.yt_is_searching = false;
+                    self.discover_is_searching = false;
                     match res {
-                        Ok(items) => {
-                            self.yt_results = items;
-                            self.yt_status_message = format!("Found {} result(s). Ready to stream or convert.", self.yt_results.len());
+                        Ok(DiscoverResults::Audius(items)) => {
+                            self.audius_results = items;
+                            self.provider_results.clear();
+                            self.discover_status_message =
+                                format!("Found {} Audius result(s).", self.audius_results.len());
+                        }
+                        Ok(DiscoverResults::Provider(items)) => {
+                            self.provider_results = items;
+                            self.audius_results.clear();
+                            self.discover_status_message = format!(
+                                "Found {} provider result(s).",
+                                self.provider_results.len()
+                            );
                         }
                         Err(e) => {
-                            self.yt_status_message = format!("Search failed: {}", e);
+                            self.discover_status_message = format!("Search failed: {}", e);
                             self.show_toast(format!("Search error: {}", e));
                         }
                     }
                 }
-                BgTaskMsg::ConvertComplete(res) => {
-                    self.yt_is_converting = false;
+                BgTaskMsg::DownloadComplete(res) => {
+                    self.discover_is_downloading = false;
                     match res {
                         Ok(track) => {
                             let title = track.title.clone();
-                            self.yt_status_message = format!("Successfully converted '{}' to MP3 and added to library!", title);
+                            self.discover_status_message =
+                                format!("Downloaded '{}' and added it to the library.", title);
                             let _ = self.db.upsert_track(&track);
                             self.db_stats = self.db.get_stats();
-                            self.converted_history.push(track.clone());
+                            self.downloaded_history.push(track.clone());
                             self.playlist.push(track);
                             self.rebuild_folder_tree();
                             self.show_toast(format!("Added to Library: {}", title));
                         }
                         Err(e) => {
-                            self.yt_status_message = format!("Conversion error: {}", e);
-                            self.show_toast(format!("Conversion failed: {}", e));
+                            self.discover_status_message = format!("Download error: {}", e);
+                            self.show_toast(format!("Download failed: {}", e));
                         }
                     }
                 }
-                BgTaskMsg::StreamComplete(res) => {
-                    match res {
-                        Ok(track) => {
-                            self.yt_status_message = format!("Streaming online: '{}' (Support Artist active)", track.title);
-                            self.playlist.push(track);
-                            let new_idx = self.playlist.len() - 1;
-                            self.play_index(new_idx);
-                        }
-                        Err(e) => {
-                            self.yt_status_message = format!("Stream error: {}", e);
-                            self.show_toast(format!("Stream failed: {}", e));
-                        }
+                BgTaskMsg::StreamComplete(res) => match res {
+                    Ok(track) => {
+                        self.discover_status_message =
+                            format!("Streaming online: '{}'.", track.title);
+                        self.playlist.push(track);
+                        let new_idx = self.playlist.len() - 1;
+                        self.play_index(new_idx);
                     }
-                }
+                    Err(e) => {
+                        self.discover_status_message = format!("Stream error: {}", e);
+                        self.show_toast(format!("Stream failed: {}", e));
+                    }
+                },
             }
         }
     }
@@ -578,7 +648,7 @@ impl eframe::App for KanonoApp {
             self.visualizer_phase += 0.06;
             // Smooth 60 FPS repaint during active audio playback (16ms)
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        } else if self.scanning > 0 || self.yt_is_searching || self.yt_is_converting {
+        } else if self.scanning > 0 || self.discover_is_searching || self.discover_is_downloading {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -639,7 +709,11 @@ impl eframe::App for KanonoApp {
 
         // Top Header
         egui::TopBottomPanel::top("top_header")
-            .frame(egui::Frame::new().fill(palette.bg_panel).inner_margin(egui::Margin::symmetric(14, 8)))
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.bg_panel)
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Logo and Branding
@@ -668,7 +742,9 @@ impl eframe::App for KanonoApp {
 
                     // Quick Theme Cycler Button
                     if ui
-                        .button(RichText::new(format!("🎨 {}", self.current_theme.label())).size(12.0))
+                        .button(
+                            RichText::new(format!("🎨 {}", self.current_theme.label())).size(12.0),
+                        )
                         .on_hover_text("Click to cycle themes (Omarchy + CRT options)")
                         .clicked()
                     {
@@ -679,25 +755,37 @@ impl eframe::App for KanonoApp {
                     // Navigation Tabs
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .selectable_label(self.current_tab == ViewTab::Settings, "⚙ Settings & DB")
+                            .selectable_label(
+                                self.current_tab == ViewTab::Settings,
+                                "⚙ Settings & DB",
+                            )
                             .clicked()
                         {
                             self.current_tab = ViewTab::Settings;
                         }
                         if ui
-                            .selectable_label(self.current_tab == ViewTab::YouTubeConverter, "📺 YouTube Converter")
+                            .selectable_label(
+                                self.current_tab == ViewTab::Discover,
+                                "🔎 Discover / Providers",
+                            )
                             .clicked()
                         {
-                            self.current_tab = ViewTab::YouTubeConverter;
+                            self.current_tab = ViewTab::Discover;
                         }
                         if ui
-                            .selectable_label(self.current_tab == ViewTab::Library, "📚 Library & Folders")
+                            .selectable_label(
+                                self.current_tab == ViewTab::Library,
+                                "📚 Library & Folders",
+                            )
                             .clicked()
                         {
                             self.current_tab = ViewTab::Library;
                         }
                         if ui
-                            .selectable_label(self.current_tab == ViewTab::NowPlaying, "📻 Now Playing")
+                            .selectable_label(
+                                self.current_tab == ViewTab::NowPlaying,
+                                "📻 Now Playing",
+                            )
                             .clicked()
                         {
                             self.current_tab = ViewTab::NowPlaying;
@@ -709,14 +797,23 @@ impl eframe::App for KanonoApp {
         // Bottom Persistent Player Bar
         egui::TopBottomPanel::bottom("bottom_player_bar")
             .min_height(82.0)
-            .frame(egui::Frame::new().fill(palette.bg_panel).stroke(Stroke::new(1.0_f32, palette.border_subtle)).inner_margin(egui::Margin::symmetric(14, 8)))
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.bg_panel)
+                    .stroke(Stroke::new(1.0_f32, palette.border_subtle))
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
+            )
             .show(ctx, |ui| {
                 self.render_bottom_player_bar(ui, &palette);
             });
 
         // Main Content Area
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(palette.bg_root).inner_margin(egui::Margin::same(12)))
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.bg_root)
+                    .inner_margin(egui::Margin::same(12)),
+            )
             .show(ctx, |ui| {
                 // Toast message banner
                 if let Some((msg, _)) = &self.toast_message {
@@ -732,7 +829,7 @@ impl eframe::App for KanonoApp {
                 match self.current_tab {
                     ViewTab::NowPlaying => self.render_now_playing_view(ui, &palette),
                     ViewTab::Library => self.render_library_view(ui, &palette),
-                    ViewTab::YouTubeConverter => self.render_youtube_converter_view(ui, &palette),
+                    ViewTab::Discover => self.render_discover_view(ui, &palette),
                     ViewTab::Settings => self.render_settings_view(ui, &palette),
                 }
 
@@ -740,11 +837,15 @@ impl eframe::App for KanonoApp {
                 if self.crt_scanlines && palette.is_crt {
                     let painter = ui.painter();
                     let clip_rect = ui.clip_rect();
-                    let line_stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 40));
+                    let line_stroke =
+                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 40));
                     let mut y = clip_rect.min.y;
                     while y < clip_rect.max.y {
                         painter.line_segment(
-                            [egui::pos2(clip_rect.min.x, y), egui::pos2(clip_rect.max.x, y)],
+                            [
+                                egui::pos2(clip_rect.min.x, y),
+                                egui::pos2(clip_rect.max.x, y),
+                            ],
                             line_stroke,
                         );
                         y += 4.0;
@@ -765,13 +866,14 @@ impl KanonoApp {
                     if let Some(track) = &self.audio.current_track {
                         ui.horizontal(|ui| {
                             let title = shorten_end(&track.title, 24);
-                            ui.label(RichText::new(title).strong().size(15.0).color(p.text_primary));
+                            ui.label(
+                                RichText::new(title)
+                                    .strong()
+                                    .size(15.0)
+                                    .color(p.text_primary),
+                            );
                             if track.is_stream {
-                                ui.label(
-                                    RichText::new("[Stream]")
-                                        .size(10.0)
-                                        .color(p.badge_text),
-                                );
+                                ui.label(RichText::new("[Stream]").size(10.0).color(p.badge_text));
                             }
                         });
                         ui.label(
@@ -788,15 +890,16 @@ impl KanonoApp {
                         } else {
                             "⏹ Stopped"
                         };
-                        ui.label(
-                            RichText::new(status_str)
-                                .size(11.0)
-                                .color(p.accent),
-                        );
+                        ui.label(RichText::new(status_str).size(11.0).color(p.accent));
                     } else {
-                        ui.label(RichText::new("No track loaded").italics().size(14.0).color(p.text_muted));
                         ui.label(
-                            RichText::new("Select a track from Library or YouTube")
+                            RichText::new("No track loaded")
+                                .italics()
+                                .size(14.0)
+                                .color(p.text_muted),
+                        );
+                        ui.label(
+                            RichText::new("Select a track from Library or Discover")
                                 .size(11.0)
                                 .color(p.text_muted),
                         );
@@ -816,8 +919,15 @@ impl KanonoApp {
                 |ui| {
                     // Controls Row
                     ui.horizontal(|ui| {
-                        let shuffle_text = if self.audio.shuffle { "🔀 On" } else { "🔀 Off" };
-                        if ui.selectable_label(self.audio.shuffle, shuffle_text).clicked() {
+                        let shuffle_text = if self.audio.shuffle {
+                            "🔀 On"
+                        } else {
+                            "🔀 Off"
+                        };
+                        if ui
+                            .selectable_label(self.audio.shuffle, shuffle_text)
+                            .clicked()
+                        {
                             self.audio.shuffle = !self.audio.shuffle;
                         }
 
@@ -825,7 +935,11 @@ impl KanonoApp {
                             self.play_previous();
                         }
 
-                        if ui.button("⏪ -10s").on_hover_text("Jump backward 10 seconds").clicked() {
+                        if ui
+                            .button("⏪ -10s")
+                            .on_hover_text("Jump backward 10 seconds")
+                            .clicked()
+                        {
                             self.audio.seek_relative(-10.0);
                         }
 
@@ -835,7 +949,12 @@ impl KanonoApp {
                             "▶ Play"
                         };
                         if ui
-                            .add_sized([100.0, 28.0], egui::Button::new(RichText::new(play_pause_icon).strong().size(14.0)))
+                            .add_sized(
+                                [100.0, 28.0],
+                                egui::Button::new(
+                                    RichText::new(play_pause_icon).strong().size(14.0),
+                                ),
+                            )
                             .clicked()
                         {
                             if self.audio.is_playing {
@@ -847,7 +966,11 @@ impl KanonoApp {
                             }
                         }
 
-                        if ui.button("+10s ⏩").on_hover_text("Jump forward 10 seconds").clicked() {
+                        if ui
+                            .button("+10s ⏩")
+                            .on_hover_text("Jump forward 10 seconds")
+                            .clicked()
+                        {
                             self.audio.seek_relative(10.0);
                         }
 
@@ -871,7 +994,12 @@ impl KanonoApp {
                         let cur_secs = self.audio.seek_drag_pos.unwrap_or(self.audio.current_pos);
                         let total_secs = self.audio.total_duration.max(0.1);
 
-                        ui.label(RichText::new(format_time(cur_secs)).size(12.0).monospace().color(p.text_primary));
+                        ui.label(
+                            RichText::new(format_time(cur_secs))
+                                .size(12.0)
+                                .monospace()
+                                .color(p.text_primary),
+                        );
 
                         let mut slider_val = cur_secs;
                         let slider = egui::Slider::new(&mut slider_val, 0.0..=total_secs)
@@ -892,7 +1020,12 @@ impl KanonoApp {
                             self.audio.seek_drag_pos = None;
                         }
 
-                        ui.label(RichText::new(format_time(total_secs)).size(12.0).monospace().color(p.text_secondary));
+                        ui.label(
+                            RichText::new(format_time(total_secs))
+                                .size(12.0)
+                                .monospace()
+                                .color(p.text_secondary),
+                        );
                     });
                 },
             );
@@ -917,16 +1050,32 @@ impl KanonoApp {
                             self.audio.toggle_mute();
                         }
 
-                        let mut vol = if self.audio.is_muted { 0.0 } else { self.audio.volume };
-                        if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false)).changed() {
+                        let mut vol = if self.audio.is_muted {
+                            0.0
+                        } else {
+                            self.audio.volume
+                        };
+                        if ui
+                            .add(egui::Slider::new(&mut vol, 0.0..=1.0).show_value(false))
+                            .changed()
+                        {
                             if self.audio.is_muted {
                                 self.audio.is_muted = false;
                             }
                             self.audio.set_volume(vol);
                         }
                     });
-                    let vol_pct = (if self.audio.is_muted { 0.0 } else { self.audio.volume } * 100.0).round() as u32;
-                    ui.label(RichText::new(format!("Volume: {}%", vol_pct)).size(11.0).color(p.text_secondary));
+                    let vol_pct = (if self.audio.is_muted {
+                        0.0
+                    } else {
+                        self.audio.volume
+                    } * 100.0)
+                        .round() as u32;
+                    ui.label(
+                        RichText::new(format!("Volume: {}%", vol_pct))
+                            .size(11.0)
+                            .color(p.text_secondary),
+                    );
                 },
             );
         });
@@ -943,35 +1092,48 @@ impl KanonoApp {
                         ui.add_space(8.0);
 
                         // CRT / Vinyl Turntable Display Card
-                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(280.0, 160.0), egui::Sense::hover());
+                        let (rect, _response) =
+                            ui.allocate_exact_size(egui::vec2(280.0, 160.0), egui::Sense::hover());
                         let painter = ui.painter();
 
                         // Background card
                         painter.rect_filled(rect, 8.0, p.bg_card);
-                        painter.rect_stroke(rect, 8.0, Stroke::new(1.0_f32, p.border), egui::StrokeKind::Inside);
+                        painter.rect_stroke(
+                            rect,
+                            8.0,
+                            Stroke::new(1.0_f32, p.border),
+                            egui::StrokeKind::Inside,
+                        );
 
                         // Disc graphic
                         let center = rect.center();
                         let radius = 54.0;
                         painter.circle_filled(center, radius, Color32::from_rgb(14, 16, 24));
                         painter.circle_stroke(center, radius, Stroke::new(2.0_f32, p.accent));
-                        painter.circle_stroke(center, radius * 0.70, Stroke::new(1.0_f32, p.border_subtle));
+                        painter.circle_stroke(
+                            center,
+                            radius * 0.70,
+                            Stroke::new(1.0_f32, p.border_subtle),
+                        );
                         painter.circle_filled(center, 14.0, p.accent_hover);
 
                         ui.add_space(14.0);
 
                         // Animated Frequency Spectrum Bars with Palette Colors
-                        let (vis_rect, _) = ui.allocate_exact_size(egui::vec2(320.0, 52.0), egui::Sense::hover());
+                        let (vis_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(320.0, 52.0), egui::Sense::hover());
                         let vis_painter = ui.painter();
                         let num_bars = 32;
                         let bar_width = 7.0;
                         let spacing = 3.0;
-                        let start_x = vis_rect.left() + (vis_rect.width() - (num_bars as f32 * (bar_width + spacing))) / 2.0;
+                        let start_x = vis_rect.left()
+                            + (vis_rect.width() - (num_bars as f32 * (bar_width + spacing))) / 2.0;
 
                         for i in 0..num_bars {
                             let factor = if self.audio.is_playing && !self.audio.is_paused {
                                 let f = (self.visualizer_phase + i as f32 * 0.32).sin().abs();
-                                let f2 = (self.visualizer_phase * 1.35 + i as f32 * 0.20).cos().abs();
+                                let f2 =
+                                    (self.visualizer_phase * 1.35 + i as f32 * 0.20).cos().abs();
                                 (f * 0.65 + f2 * 0.35).clamp(0.12, 1.0)
                             } else {
                                 0.08
@@ -990,7 +1152,10 @@ impl KanonoApp {
                             };
 
                             vis_painter.rect_filled(
-                                egui::Rect::from_min_size(egui::pos2(bar_x, bar_y), egui::vec2(bar_width, bar_height)),
+                                egui::Rect::from_min_size(
+                                    egui::pos2(bar_x, bar_y),
+                                    egui::vec2(bar_width, bar_height),
+                                ),
                                 2.0,
                                 color,
                             );
@@ -1032,18 +1197,31 @@ impl KanonoApp {
 
             // Right Column: Track Details & Active Playlist
             columns[1].vertical(|ui| {
+                let mut support_url_to_open = None;
                 if let Some(track) = &self.audio.current_track {
                     ui.group(|ui| {
                         ui.heading(RichText::new(&track.title).size(18.0).color(p.text_primary));
                         ui.add_space(4.0);
-                        ui.label(RichText::new(format!("Artist: {}", track.artist)).size(14.0).color(p.text_secondary));
-                        ui.label(RichText::new(format!("Album: {}", track.album)).size(12.0).color(p.text_muted));
-                        ui.label(RichText::new(format!("Duration: {}", track.duration_formatted())).size(12.0).color(p.text_muted));
+                        ui.label(
+                            RichText::new(format!("Artist: {}", track.artist))
+                                .size(14.0)
+                                .color(p.text_secondary),
+                        );
+                        ui.label(
+                            RichText::new(format!("Album: {}", track.album))
+                                .size(12.0)
+                                .color(p.text_muted),
+                        );
+                        ui.label(
+                            RichText::new(format!("Duration: {}", track.duration_formatted()))
+                                .size(12.0)
+                                .color(p.text_muted),
+                        );
 
                         if track.is_stream {
                             ui.add_space(4.0);
                             ui.label(
-                                RichText::new("✨ Live YouTube Stream (Supporting artist)")
+                                RichText::new("✨ Online stream")
                                     .color(p.badge_text)
                                     .strong(),
                             );
@@ -1055,12 +1233,30 @@ impl KanonoApp {
                                     .color(p.text_muted),
                             );
                         }
+                        if let Some(url) = &track.support_url {
+                            if ui
+                                .button(
+                                    RichText::new("❤ Support Artist")
+                                        .color(p.badge_text)
+                                        .strong(),
+                                )
+                                .on_hover_text("Open the artist or support link in your browser")
+                                .clicked()
+                            {
+                                support_url_to_open = Some(url.clone());
+                            }
+                        }
                     });
                 } else {
                     ui.group(|ui| {
                         ui.heading("No Track Currently Playing");
-                        ui.label("Add local audio files or search YouTube in the tabs above.");
+                        ui.label("Add local audio files or search for legal streams in Discover.");
                     });
+                }
+                if let Some(url) = support_url_to_open {
+                    if let Err(error) = open::that(&url) {
+                        self.show_toast(format!("Could not open support link: {}", error));
+                    }
                 }
 
                 ui.add_space(10.0);
@@ -1087,8 +1283,10 @@ impl KanonoApp {
                     .show(ui, |ui| {
                         if self.queue.is_empty() {
                             ui.label(
-                                RichText::new("Queue is empty. Add songs with “＋ Queue” in the Library.")
-                                    .color(p.text_muted),
+                                RichText::new(
+                                    "Queue is empty. Add songs with “＋ Queue” in the Library.",
+                                )
+                                .color(p.text_muted),
                             );
                         }
                         let n = self.queue.len();
@@ -1096,20 +1294,34 @@ impl KanonoApp {
                             ui.horizontal(|ui| {
                                 ui.label(format!("{}.", qi + 1));
                                 ui.label(shorten_end(&format!("{} — {}", t.title, t.artist), 38));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("✖").on_hover_text("Remove from queue").clicked() {
-                                        q_remove = Some(qi);
-                                    }
-                                    if ui.add_enabled(qi + 1 < n, egui::Button::new("⬇").small()).clicked() {
-                                        q_move = Some((qi, 1));
-                                    }
-                                    if ui.add_enabled(qi > 0, egui::Button::new("⬆").small()).clicked() {
-                                        q_move = Some((qi, -1));
-                                    }
-                                    if ui.small_button("▶").on_hover_text("Play now").clicked() {
-                                        q_play = Some(qi);
-                                    }
-                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("✖")
+                                            .on_hover_text("Remove from queue")
+                                            .clicked()
+                                        {
+                                            q_remove = Some(qi);
+                                        }
+                                        if ui
+                                            .add_enabled(qi + 1 < n, egui::Button::new("⬇").small())
+                                            .clicked()
+                                        {
+                                            q_move = Some((qi, 1));
+                                        }
+                                        if ui
+                                            .add_enabled(qi > 0, egui::Button::new("⬆").small())
+                                            .clicked()
+                                        {
+                                            q_move = Some((qi, -1));
+                                        }
+                                        if ui.small_button("▶").on_hover_text("Play now").clicked()
+                                        {
+                                            q_play = Some(qi);
+                                        }
+                                    },
+                                );
                             });
                         }
                     });
@@ -1144,33 +1356,51 @@ impl KanonoApp {
                 });
 
                 // Scrollable list of active tracks
-                egui::ScrollArea::vertical().id_salt("np_playlist").max_height(240.0).show(ui, |ui| {
-                    let mut play_target = None;
-                    let mut enqueue_target = None;
-                    for (i, t) in self.playlist.iter().enumerate() {
-                        let is_current = self.current_index == Some(i);
-                        ui.horizontal(|ui| {
-                            let prefix = if is_current { "▶ " } else { "  " };
-                            let label_text = shorten_end(&format!("{}{}. {} - {}", prefix, i + 1, t.artist, t.title), 42);
-                            let response = ui.selectable_label(is_current, label_text);
-                            if response.clicked() {
-                                play_target = Some(i);
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new(t.duration_formatted()).size(12.0).monospace().color(p.text_secondary));
-                                if ui.small_button("＋").on_hover_text("Add to queue").clicked() {
-                                    enqueue_target = Some(i);
+                egui::ScrollArea::vertical()
+                    .id_salt("np_playlist")
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        let mut play_target = None;
+                        let mut enqueue_target = None;
+                        for (i, t) in self.playlist.iter().enumerate() {
+                            let is_current = self.current_index == Some(i);
+                            ui.horizontal(|ui| {
+                                let prefix = if is_current { "▶ " } else { "  " };
+                                let label_text = shorten_end(
+                                    &format!("{}{}. {} - {}", prefix, i + 1, t.artist, t.title),
+                                    42,
+                                );
+                                let response = ui.selectable_label(is_current, label_text);
+                                if response.clicked() {
+                                    play_target = Some(i);
                                 }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(t.duration_formatted())
+                                                .size(12.0)
+                                                .monospace()
+                                                .color(p.text_secondary),
+                                        );
+                                        if ui
+                                            .small_button("＋")
+                                            .on_hover_text("Add to queue")
+                                            .clicked()
+                                        {
+                                            enqueue_target = Some(i);
+                                        }
+                                    },
+                                );
                             });
-                        });
-                    }
-                    if let Some(idx) = play_target {
-                        self.play_index(idx);
-                    }
-                    if let Some(idx) = enqueue_target {
-                        self.enqueue(idx, false);
-                    }
-                });
+                        }
+                        if let Some(idx) = play_target {
+                            self.play_index(idx);
+                        }
+                        if let Some(idx) = enqueue_target {
+                            self.enqueue(idx, false);
+                        }
+                    });
             });
         });
     }
@@ -1188,13 +1418,24 @@ impl KanonoApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("🔄 Rescan All").on_hover_text("Rescan all library folders and update SQLite catalog").clicked() {
+                if ui
+                    .button("🔄 Rescan All")
+                    .on_hover_text("Rescan all library folders and update SQLite catalog")
+                    .clicked()
+                {
                     self.rescan_library();
                 }
 
-                if ui.button("🎵 Add Files").on_hover_text("Select local audio files").clicked() {
+                if ui
+                    .button("🎵 Add Files")
+                    .on_hover_text("Select local audio files")
+                    .clicked()
+                {
                     if let Some(files) = rfd::FileDialog::new()
-                        .add_filter("Audio Files", &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"])
+                        .add_filter(
+                            "Audio Files",
+                            &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"],
+                        )
                         .pick_files()
                     {
                         let mut tracks = Vec::new();
@@ -1216,7 +1457,11 @@ impl KanonoApp {
                     }
                 }
 
-                if ui.button("📂 Add Folder").on_hover_text("Index a directory tree into SQLite").clicked() {
+                if ui
+                    .button("📂 Add Folder")
+                    .on_hover_text("Index a directory tree into SQLite")
+                    .clicked()
+                {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         self.add_folder(folder);
                     }
@@ -1315,13 +1560,22 @@ impl KanonoApp {
 
             // Mode Selector
             ui.horizontal(|ui| {
-                if ui.selectable_label(self.sidebar_mode == SidebarMode::FolderTree, "📁 Tree").clicked() {
+                if ui
+                    .selectable_label(self.sidebar_mode == SidebarMode::FolderTree, "📁 Tree")
+                    .clicked()
+                {
                     self.sidebar_mode = SidebarMode::FolderTree;
                 }
-                if ui.selectable_label(self.sidebar_mode == SidebarMode::Albums, "💿 Albums").clicked() {
+                if ui
+                    .selectable_label(self.sidebar_mode == SidebarMode::Albums, "💿 Albums")
+                    .clicked()
+                {
                     self.sidebar_mode = SidebarMode::Albums;
                 }
-                if ui.selectable_label(self.sidebar_mode == SidebarMode::Artists, "👤 Artists").clicked() {
+                if ui
+                    .selectable_label(self.sidebar_mode == SidebarMode::Artists, "👤 Artists")
+                    .clicked()
+                {
                     self.sidebar_mode = SidebarMode::Artists;
                 }
             });
@@ -1332,10 +1586,18 @@ impl KanonoApp {
                 SidebarMode::FolderTree => {
                     // Tree Controls
                     ui.horizontal(|ui| {
-                        if ui.small_button("➕ All").on_hover_text("Expand all tree folders").clicked() {
+                        if ui
+                            .small_button("➕ All")
+                            .on_hover_text("Expand all tree folders")
+                            .clicked()
+                        {
                             self.folder_tree.expand_all();
                         }
-                        if ui.small_button("➖ All").on_hover_text("Collapse all folders").clicked() {
+                        if ui
+                            .small_button("➖ All")
+                            .on_hover_text("Collapse all folders")
+                            .clicked()
+                        {
                             self.folder_tree.collapse_all();
                         }
                         ui.checkbox(&mut self.folder_tree.include_subfolders, "Subfolders");
@@ -1351,7 +1613,10 @@ impl KanonoApp {
                             let total = self.playlist.len();
                             let is_all_selected = self.folder_tree.selected_path.is_none();
                             if ui
-                                .selectable_label(is_all_selected, format!("📁 All Folders ({})", total))
+                                .selectable_label(
+                                    is_all_selected,
+                                    format!("📁 All Folders ({})", total),
+                                )
                                 .clicked()
                             {
                                 self.folder_tree.selected_path = None;
@@ -1366,7 +1631,8 @@ impl KanonoApp {
                         });
                 }
                 SidebarMode::Albums => {
-                    let mut album_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                    let mut album_counts: std::collections::BTreeMap<String, usize> =
+                        std::collections::BTreeMap::new();
                     for t in &self.playlist {
                         *album_counts.entry(t.album.clone()).or_default() += 1;
                     }
@@ -1376,20 +1642,28 @@ impl KanonoApp {
                         .max_height(ui.available_height() - 10.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            if ui.selectable_label(self.album_filter.is_none(), format!("💿 All Albums ({})", self.playlist.len())).clicked() {
+                            if ui
+                                .selectable_label(
+                                    self.album_filter.is_none(),
+                                    format!("💿 All Albums ({})", self.playlist.len()),
+                                )
+                                .clicked()
+                            {
                                 self.album_filter = None;
                             }
                             for (album, count) in album_counts {
                                 let is_selected = self.album_filter.as_deref() == Some(&album);
                                 let text = format!("💿 {} ({})", shorten_end(&album, 24), count);
                                 if ui.selectable_label(is_selected, text).clicked() {
-                                    self.album_filter = if is_selected { None } else { Some(album) };
+                                    self.album_filter =
+                                        if is_selected { None } else { Some(album) };
                                 }
                             }
                         });
                 }
                 SidebarMode::Artists => {
-                    let mut artist_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                    let mut artist_counts: std::collections::BTreeMap<String, usize> =
+                        std::collections::BTreeMap::new();
                     for t in &self.playlist {
                         *artist_counts.entry(t.artist.clone()).or_default() += 1;
                     }
@@ -1399,14 +1673,21 @@ impl KanonoApp {
                         .max_height(ui.available_height() - 10.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            if ui.selectable_label(self.artist_filter.is_none(), format!("👤 All Artists ({})", self.playlist.len())).clicked() {
+                            if ui
+                                .selectable_label(
+                                    self.artist_filter.is_none(),
+                                    format!("👤 All Artists ({})", self.playlist.len()),
+                                )
+                                .clicked()
+                            {
                                 self.artist_filter = None;
                             }
                             for (artist, count) in artist_counts {
                                 let is_selected = self.artist_filter.as_deref() == Some(&artist);
                                 let text = format!("👤 {} ({})", shorten_end(&artist, 24), count);
                                 if ui.selectable_label(is_selected, text).clicked() {
-                                    self.artist_filter = if is_selected { None } else { Some(artist) };
+                                    self.artist_filter =
+                                        if is_selected { None } else { Some(artist) };
                                 }
                             }
                         });
@@ -1415,7 +1696,13 @@ impl KanonoApp {
         });
     }
 
-    fn render_tree_node(&mut self, ui: &mut egui::Ui, node: &FolderTreeNode, depth: usize, p: &ThemePalette) {
+    fn render_tree_node(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &FolderTreeNode,
+        depth: usize,
+        p: &ThemePalette,
+    ) {
         let has_children = !node.children.is_empty();
         let is_expanded = self.folder_tree.is_expanded(&node.full_path);
         let is_selected = self.folder_tree.selected_path.as_ref() == Some(&node.full_path);
@@ -1472,7 +1759,11 @@ impl KanonoApp {
                     self.folder_tree.selected_path = None;
                 }
             } else {
-                ui.label(RichText::new("All Library Folders").italics().color(p.text_muted));
+                ui.label(
+                    RichText::new("All Library Folders")
+                        .italics()
+                        .color(p.text_muted),
+                );
             }
 
             if let Some(alb) = &self.album_filter {
@@ -1550,7 +1841,9 @@ impl KanonoApp {
                 SortKey::Artist => order.sort_by_key(|&i| pl[i].artist.to_lowercase()),
                 SortKey::Album => order.sort_by_key(|&i| pl[i].album.to_lowercase()),
                 SortKey::Folder => order.sort_by_key(|&i| pl[i].folder().to_lowercase()),
-                SortKey::Duration => order.sort_by(|&a, &b| pl[a].duration.total_cmp(&pl[b].duration)),
+                SortKey::Duration => {
+                    order.sort_by(|&a, &b| pl[a].duration.total_cmp(&pl[b].duration))
+                }
             }
             if self.sort_desc {
                 order.reverse();
@@ -1558,9 +1851,13 @@ impl KanonoApp {
         }
 
         ui.label(
-            RichText::new(format!("Showing {} of {} tracks", order.len(), self.playlist.len()))
-                .size(12.0)
-                .color(p.text_muted),
+            RichText::new(format!(
+                "Showing {} of {} tracks",
+                order.len(),
+                self.playlist.len()
+            ))
+            .size(12.0)
+            .color(p.text_muted),
         );
 
         let mut remove_index = None;
@@ -1582,7 +1879,9 @@ impl KanonoApp {
 
         if order.is_empty() {
             ui.add_space(30.0);
-            ui.vertical_centered(|ui| ui.label("No tracks match your current filter or folder selection."));
+            ui.vertical_centered(|ui| {
+                ui.label("No tracks match your current filter or folder selection.")
+            });
             return;
         }
 
@@ -1630,7 +1929,11 @@ impl KanonoApp {
                                 if is_current {
                                     ui.label(RichText::new("▶").color(p.accent).strong());
                                 } else {
-                                    ui.label(RichText::new(format!("{:3}", row_idx + 1)).monospace().color(p.text_muted));
+                                    ui.label(
+                                        RichText::new(format!("{:3}", row_idx + 1))
+                                            .monospace()
+                                            .color(p.text_muted),
+                                    );
                                 }
 
                                 ui.add_space(8.0);
@@ -1651,28 +1954,55 @@ impl KanonoApp {
                                 ui.add_space(8.0);
 
                                 // Artist
-                                ui.label(RichText::new(shorten_end(&track.artist, 20)).color(p.text_secondary));
+                                ui.label(
+                                    RichText::new(shorten_end(&track.artist, 20))
+                                        .color(p.text_secondary),
+                                );
 
                                 ui.add_space(8.0);
 
                                 // Album
-                                ui.label(RichText::new(shorten_end(&track.album, 18)).color(p.text_muted));
+                                ui.label(
+                                    RichText::new(shorten_end(&track.album, 18))
+                                        .color(p.text_muted),
+                                );
 
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("🗑").on_hover_text("Remove from catalog").clicked() {
-                                        remove_index = Some(i);
-                                    }
-                                    if ui.small_button("⏭").on_hover_text("Play next").clicked() {
-                                        queue_add = Some((i, true));
-                                    }
-                                    if ui.small_button("＋").on_hover_text("Add to queue").clicked() {
-                                        queue_add = Some((i, false));
-                                    }
-                                    if ui.small_button("▶").on_hover_text("Play track").clicked() {
-                                        play_index = Some(i);
-                                    }
-                                    ui.label(RichText::new(track.duration_formatted()).monospace().size(12.0).color(p.text_secondary));
-                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("🗑")
+                                            .on_hover_text("Remove from catalog")
+                                            .clicked()
+                                        {
+                                            remove_index = Some(i);
+                                        }
+                                        if ui.small_button("⏭").on_hover_text("Play next").clicked()
+                                        {
+                                            queue_add = Some((i, true));
+                                        }
+                                        if ui
+                                            .small_button("＋")
+                                            .on_hover_text("Add to queue")
+                                            .clicked()
+                                        {
+                                            queue_add = Some((i, false));
+                                        }
+                                        if ui
+                                            .small_button("▶")
+                                            .on_hover_text("Play track")
+                                            .clicked()
+                                        {
+                                            play_index = Some(i);
+                                        }
+                                        ui.label(
+                                            RichText::new(track.duration_formatted())
+                                                .monospace()
+                                                .size(12.0)
+                                                .color(p.text_secondary),
+                                        );
+                                    },
+                                );
                             });
                         });
                 }
@@ -1689,161 +2019,177 @@ impl KanonoApp {
         }
     }
 
-    fn render_youtube_converter_view(&mut self, ui: &mut egui::Ui, p: &ThemePalette) {
+    fn render_discover_view(&mut self, ui: &mut egui::Ui, p: &ThemePalette) {
         ui.add_space(8.0);
-        ui.heading("📺 YouTube Music: Stream & Offline MP3 Converter");
-        ui.add_space(6.0);
+        ui.heading("🔎 Discover / Providers");
+        ui.label("Search Audius or run an external provider configured by you. Downloads are shown only when the source explicitly permits them.");
+        ui.add_space(8.0);
+
+        if let Some(error) = &self.provider_config_error {
+            ui.colored_label(p.accent, format!("Provider configuration: {}", error));
+        }
 
         ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("1. Stream Music Online (Support Artists)")
-                            .color(p.badge_text)
-                            .size(14.0)
-                            .strong(),
-                    );
-                    ui.label("Direct streaming plays audio over network, contributing to artist metrics without saving to disk.");
-                });
-                ui.separator();
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("2. Convert to MP3 into SQLite Library")
-                            .color(p.accent)
-                            .size(14.0)
-                            .strong(),
-                    );
-                    ui.label("Downloads high-quality MP3 directly into your offline library and indexes it into the SQLite database.");
-                });
-            });
-        });
+                ui.label("Source:");
+                let selected = self
+                    .active_provider
+                    .and_then(|index| self.providers.get(index))
+                    .map(|provider| provider.name.as_str())
+                    .unwrap_or("Audius");
+                egui::ComboBox::from_id_salt("discover_source")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(self.active_provider.is_none(), "Audius")
+                            .clicked()
+                        {
+                            self.active_provider = None;
+                        }
+                        for (index, provider) in self.providers.iter().enumerate() {
+                            if ui
+                                .selectable_label(
+                                    self.active_provider == Some(index),
+                                    &provider.name,
+                                )
+                                .clicked()
+                            {
+                                self.active_provider = Some(index);
+                            }
+                        }
+                    });
 
-        ui.add_space(10.0);
-
-        // Search Bar
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.label("Search or URL:");
                 let text_edit = ui.add_sized(
-                    [ui.available_width() - 220.0, 26.0],
-                    egui::TextEdit::singleline(&mut self.yt_search_input)
-                        .hint_text("Paste YouTube link (https://youtube.com/watch?v=...) or search track title / artist..."),
+                    [ui.available_width() - 180.0, 26.0],
+                    egui::TextEdit::singleline(&mut self.provider_search_input)
+                        .hint_text("Search for an artist, track, or provider URL"),
                 );
-
                 if text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.start_yt_search();
+                    self.start_discover_search();
                 }
-
-                if self.yt_is_searching {
+                if self.discover_is_searching {
                     ui.add(egui::Spinner::new());
-                    ui.label("Searching...");
-                } else if ui.button("🔍 Search / Resolve").clicked() {
-                    self.start_yt_search();
-                }
-            });
-
-            ui.add_space(6.0);
-
-            // Quick Presets
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Quick Presets:").size(12.0).color(p.text_muted));
-                if ui.small_button("☕ Lofi Hip Hop").clicked() {
-                    self.yt_search_input = "lofi hip hop radio".to_string();
-                    self.start_yt_search();
-                }
-                if ui.small_button("🌆 Synthwave").clicked() {
-                    self.yt_search_input = "synthwave radio chill".to_string();
-                    self.start_yt_search();
-                }
-                if ui.small_button("🎸 Acoustic Guitar").clicked() {
-                    self.yt_search_input = "acoustic guitar instrumental".to_string();
-                    self.start_yt_search();
-                }
-                if ui.small_button("🎹 Classical Piano").clicked() {
-                    self.yt_search_input = "classical piano relax".to_string();
-                    self.start_yt_search();
+                } else if ui.button("🔍 Search").clicked() {
+                    self.start_discover_search();
                 }
             });
         });
 
         ui.add_space(8.0);
-
-        // Status Card
         ui.horizontal(|ui| {
             ui.label(RichText::new("Status:").strong());
-            ui.label(RichText::new(&self.yt_status_message).color(p.accent));
-            if self.yt_is_converting {
+            ui.label(RichText::new(&self.discover_status_message).color(p.accent));
+            if self.discover_is_downloading {
                 ui.add(egui::Spinner::new());
             }
         });
 
         ui.add_space(8.0);
-        ui.separator();
-
-        // Search Results List
         egui::ScrollArea::vertical().show(ui, |ui| {
-            if !self.yt_results.is_empty() {
-                ui.heading("Search Results");
-                ui.add_space(6.0);
-
+            if !self.audius_results.is_empty() {
+                ui.heading("Audius results");
                 let mut stream_target = None;
-                let mut convert_target = None;
-
-                for (_idx, item) in self.yt_results.iter().enumerate() {
+                let mut download_target = None;
+                for item in &self.audius_results {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(&item.title).strong().size(14.0).color(p.text_primary));
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(format!("Channel: {}", item.channel)).size(11.0).color(p.text_secondary));
-                                    ui.label(RichText::new(format!("Duration: {}", item.duration_formatted())).size(11.0).monospace().color(p.text_muted));
-                                });
+                                ui.label(RichText::new(&item.title).strong().color(p.text_primary));
+                                ui.label(format!(
+                                    "{} · {}",
+                                    item.artist,
+                                    item.duration_formatted()
+                                ));
                             });
-
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .button(RichText::new("📥 Convert to MP3 & Save").color(p.accent))
-                                    .on_hover_text("Download and convert audio to MP3 in local library")
-                                    .clicked()
-                                {
-                                    convert_target = Some(item.clone());
-                                }
-
-                                if ui
-                                    .button(RichText::new("▶ Stream Online (Support Artist)").color(p.badge_text))
-                                    .on_hover_text("Direct stream playback - supports artist views")
-                                    .clicked()
-                                {
-                                    stream_target = Some(item.clone());
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if item.is_downloadable
+                                        && ui.button("📥 Download to Library").clicked()
+                                    {
+                                        download_target = Some(item.clone());
+                                    }
+                                    if ui.button("▶ Stream").clicked() {
+                                        stream_target = Some(item.clone());
+                                    }
+                                },
+                            );
                         });
                     });
                     ui.add_space(4.0);
                 }
-
                 if let Some(item) = stream_target {
-                    self.start_yt_stream(item);
+                    self.start_audius_stream(item);
                 }
-                if let Some(item) = convert_target {
-                    self.start_yt_convert(item);
+                if let Some(item) = download_target {
+                    self.start_audius_download(item);
                 }
-            } else if !self.yt_is_searching {
-                ui.add_space(20.0);
+            }
+
+            if !self.provider_results.is_empty() {
+                ui.heading("Provider results");
+                let mut stream_target = None;
+                let mut download_target = None;
+                let provider = self
+                    .active_provider
+                    .and_then(|index| self.providers.get(index).cloned());
+                for item in &self.provider_results {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&item.title).strong().color(p.text_primary));
+                                ui.label(format!(
+                                    "{} · {}",
+                                    item.artist,
+                                    item.duration_formatted()
+                                ));
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if item.downloadable
+                                        && ui.button("📥 Download to Library").clicked()
+                                    {
+                                        download_target = Some(item.clone());
+                                    }
+                                    if ui.button("▶ Stream").clicked() {
+                                        stream_target = Some(item.clone());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+                if let Some((item, provider)) = stream_target.zip(provider.clone()) {
+                    self.start_provider_stream(provider, item);
+                }
+                if let Some((item, provider)) = download_target.zip(provider) {
+                    self.start_provider_download(provider, item);
+                }
+            }
+
+            if self.audius_results.is_empty()
+                && self.provider_results.is_empty()
+                && !self.discover_is_searching
+            {
                 ui.vertical_centered(|ui| {
-                    ui.label("Enter a search term or YouTube URL above to stream or convert music.");
+                    ui.label("Choose a source and enter a search query to discover music.");
+                    ui.label(format!(
+                        "Provider configuration: {}",
+                        providers::config_path().display()
+                    ));
                 });
             }
 
-            if !self.converted_history.is_empty() {
+            if !self.downloaded_history.is_empty() {
                 ui.add_space(16.0);
-                ui.heading("Recently Converted Tracks");
-                for track in &self.converted_history {
+                ui.heading("Recently downloaded");
+                for track in &self.downloaded_history {
                     ui.horizontal(|ui| {
                         ui.label("✔");
                         ui.label(RichText::new(&track.title).strong());
                         ui.label(format!("- {}", track.artist));
-                        ui.label(format!("({})", track.duration_formatted()));
                     });
                 }
             }
@@ -1927,7 +2273,7 @@ impl KanonoApp {
                 ui.add_space(6.0);
 
                 ui.label(format!("Local Library Root: {}", self.library_dir.display()));
-                ui.label(format!("Demo Tracks Root: {}", self.demo_dir.display()));
+                ui.label(format!("Provider Config: {}", providers::config_path().display()));
 
                 let mut to_remove = None;
                 if !self.saved.folders.is_empty() {
@@ -1964,7 +2310,8 @@ impl KanonoApp {
                 ui.label("Rendering Engine: eframe 0.31 with Adaptive 60 FPS Event Limiter (Zero CPU Lag)");
                 ui.label("Audio Output Backend: CPAL / Rodio (Low-latency ALSA / PulseAudio)");
                 ui.label("Seek Engine: Precision time-indexed seek with fallback frame reconstruction");
-                ui.label("External Decoding Tools: FFmpeg & yt-dlp available");
+                ui.label("Metadata Backend: Pure-Rust lofty tag and audio-property reader");
+                ui.label("External Providers: Optional user-configured command hooks");
             });
         });
     }

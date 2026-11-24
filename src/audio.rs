@@ -1,7 +1,7 @@
+use crate::library::Track;
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
-use crate::library::Track;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepeatMode {
@@ -37,7 +37,9 @@ fn open_decoder(path: &str) -> Result<rodio::Decoder<BufReader<File>>, String> {
     if len > 0 {
         builder = builder.with_byte_len(len);
     }
-    builder.build().map_err(|e| format!("Failed to decode audio: {}", e))
+    builder
+        .build()
+        .map_err(|e| format!("Failed to decode audio: {}", e))
 }
 
 pub struct AudioEngine {
@@ -69,7 +71,9 @@ impl AudioEngine {
                     .ok()
             })
             .or_else(|| rodio::DeviceSinkBuilder::open_default_sink().ok());
-        let player = handle.as_ref().map(|h| rodio::Player::connect_new(&h.mixer()));
+        let player = handle
+            .as_ref()
+            .map(|h| rodio::Player::connect_new(&h.mixer()));
         let mut engine = Self {
             _handle: handle,
             player,
@@ -91,7 +95,10 @@ impl AudioEngine {
     }
 
     pub fn play_track(&mut self, track: Track) -> Result<(), String> {
-        let file_path = track.file_path.clone().ok_or_else(|| "Track has no file path".to_string())?;
+        let file_path = track
+            .file_path
+            .clone()
+            .ok_or_else(|| "Track has no file path".to_string())?;
 
         let decoder = open_decoder(&file_path)?;
         let mut track = track;
@@ -150,15 +157,27 @@ impl AudioEngine {
         if !target_secs.is_finite() {
             return;
         }
-        let max = if self.total_duration.is_finite() { self.total_duration.max(0.0) } else { 0.0 };
-        let target_secs = if max > 0.0 { target_secs.clamp(0.0, max) } else { target_secs.max(0.0) };
+        let max = if self.total_duration.is_finite() {
+            self.total_duration.max(0.0)
+        } else {
+            0.0
+        };
+        let target_secs = if max > 0.0 {
+            target_secs.clamp(0.0, max)
+        } else {
+            target_secs.max(0.0)
+        };
         self.current_pos = target_secs;
 
         if let Some(player) = &self.player {
             let dur = Duration::from_secs_f32(target_secs);
             if player.try_seek(dur).is_ok() {
                 self.pos_offset = 0.0;
-            } else if let Some(path) = self.current_track.as_ref().and_then(|t| t.file_path.clone()) {
+            } else if let Some(path) = self
+                .current_track
+                .as_ref()
+                .and_then(|t| t.file_path.clone())
+            {
                 // Fallback: reload the file and skip ahead to the target
                 if let Ok(decoder) = open_decoder(&path) {
                     use rodio::Source;

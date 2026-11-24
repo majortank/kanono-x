@@ -1,7 +1,8 @@
+use lofty::prelude::{AudioFile, ItemKey, TaggedFileExt};
+use lofty::read_from_path;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -10,10 +11,18 @@ pub struct Track {
     pub title: String,
     pub artist: String,
     pub album: String,
-    pub duration: f32, // Duration in seconds
+    pub duration: f32,
     pub file_path: Option<String>,
     pub is_stream: bool,
     pub stream_url: Option<String>,
+    #[serde(default)]
+    pub support_url: Option<String>,
+    #[serde(default)]
+    pub track_number: Option<u32>,
+    #[serde(default)]
+    pub bitrate: Option<u32>,
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
 }
 
 impl Track {
@@ -37,17 +46,42 @@ pub fn format_time(seconds: f32) -> String {
     }
 }
 
-type Meta = (String, String, String, f32);
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Metadata {
+    title: String,
+    artist: String,
+    album: String,
+    duration: f32,
+    track_number: Option<u32>,
+    bitrate: Option<u32>,
+    sample_rate: Option<u32>,
+    support_url: Option<String>,
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct CacheEntry {
     size: u64,
     modified: u64,
-    meta: Meta,
+    metadata: Metadata,
 }
 
 static META_CACHE: Mutex<Option<HashMap<String, CacheEntry>>> = Mutex::new(None);
-const CACHE_FILE: &str = "library_cache.json";
+
+pub fn data_dir() -> PathBuf {
+    let dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from(".local/share"))
+        .join("kanono-x");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn cache_path() -> PathBuf {
+    data_dir().join("library_cache.json")
+}
+
+fn state_path() -> PathBuf {
+    data_dir().join("library_state.json")
+}
 
 fn file_stamp(path: &Path) -> (u64, u64) {
     let md = fs::metadata(path).ok();
@@ -64,105 +98,129 @@ pub fn flush_cache() {
     if let Ok(guard) = META_CACHE.lock() {
         if let Some(map) = guard.as_ref() {
             if let Ok(text) = serde_json::to_string(map) {
-                let _ = fs::write(CACHE_FILE, text);
+                let _ = fs::write(cache_path(), text);
             }
         }
     }
 }
 
-pub fn extract_metadata(file_path: &Path) -> Meta {
+pub fn extract_metadata(file_path: &Path) -> Metadata {
     let key = file_path.to_string_lossy().to_string();
     let (size, modified) = file_stamp(file_path);
     if let Ok(mut guard) = META_CACHE.lock() {
         let map = guard.get_or_insert_with(|| {
-            fs::read_to_string(CACHE_FILE)
+            fs::read_to_string(cache_path())
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default()
         });
-        if let Some(e) = map.get(&key) {
-            if e.size == size && e.modified == modified {
-                return e.meta.clone();
+        if let Some(entry) = map.get(&key) {
+            if entry.size == size && entry.modified == modified {
+                return entry.metadata.clone();
             }
         }
     }
-    let meta = probe_metadata(file_path);
+
+    let metadata = read_metadata(file_path);
     if let Ok(mut guard) = META_CACHE.lock() {
         if let Some(map) = guard.as_mut() {
-            map.insert(key, CacheEntry { size, modified, meta: meta.clone() });
+            map.insert(
+                key,
+                CacheEntry {
+                    size,
+                    modified,
+                    metadata: metadata.clone(),
+                },
+            );
         }
     }
-    meta
+    metadata
 }
 
-fn probe_metadata(file_path: &Path) -> Meta {
+fn read_metadata(file_path: &Path) -> Metadata {
     let default_title = file_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("Unknown Track")
         .to_string();
-    let mut title = default_title.clone();
-    let mut artist = "Unknown Artist".to_string();
-    let mut album = "Unknown Album".to_string();
-    let mut duration = 0.0f32;
+    let mut metadata = Metadata {
+        title: default_title,
+        artist: "Unknown Artist".to_string(),
+        album: "Unknown Album".to_string(),
+        duration: 0.0,
+        track_number: None,
+        bitrate: None,
+        sample_rate: None,
+        support_url: None,
+    };
 
-    // Run ffprobe to extract tags and duration
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration:format_tags=title,artist,album",
-            "-of",
-            "default=noprint_wrappers=1",
-            file_path.to_str().unwrap_or_default(),
-        ])
-        .output();
+    let Ok(tagged_file) = read_from_path(file_path) else {
+        return metadata;
+    };
 
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(dur_str) = line.strip_prefix("duration=") {
-                if let Ok(d) = dur_str.parse::<f32>() {
-                    if d.is_finite() && d >= 0.0 {
-                        duration = d;
-                    }
-                }
-            } else if let Some(t) = line.strip_prefix("TAG:title=") {
-                if !t.is_empty() {
-                    title = t.to_string();
-                }
-            } else if let Some(a) = line.strip_prefix("TAG:artist=") {
-                if !a.is_empty() {
-                    artist = a.to_string();
-                }
-            } else if let Some(al) = line.strip_prefix("TAG:album=") {
-                if !al.is_empty() {
-                    album = al.to_string();
-                }
+    let properties = tagged_file.properties();
+    metadata.duration = properties.duration().as_secs_f32();
+    metadata.bitrate = properties.audio_bitrate();
+    metadata.sample_rate = properties.sample_rate();
+
+    if let Some(tag) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    {
+        if let Some(value) = tag.get_string(ItemKey::TrackTitle) {
+            if !value.is_empty() {
+                metadata.title = value.to_string();
             }
         }
+        if let Some(value) = tag.get_string(ItemKey::TrackArtist) {
+            if !value.is_empty() {
+                metadata.artist = value.to_string();
+            }
+        }
+        if let Some(value) = tag.get_string(ItemKey::AlbumTitle) {
+            if !value.is_empty() {
+                metadata.album = value.to_string();
+            }
+        }
+        metadata.track_number = tag
+            .get_string(ItemKey::TrackNumber)
+            .and_then(|value| value.split('/').next()?.parse().ok());
+        metadata.support_url = tag
+            .items()
+            .map(|item| format!("{:?}", item.value()))
+            .find_map(|value| find_http_url(&value));
     }
 
-    (title, artist, album, duration)
+    metadata
+}
+
+fn find_http_url(value: &str) -> Option<String> {
+    value
+        .split_whitespace()
+        .map(|candidate| candidate.trim_matches(|c: char| "\"'<>[](),".contains(c)))
+        .find(|candidate| candidate.starts_with("https://") || candidate.starts_with("http://"))
+        .map(ToString::to_string)
 }
 
 pub fn load_local_track(file_path: &Path) -> Option<Track> {
     if !file_path.exists() || !file_path.is_file() {
         return None;
     }
-    let (title, artist, album, duration) = extract_metadata(file_path);
+    let metadata = extract_metadata(file_path);
     let id = format!("{:x}", md5_hash(file_path.to_str().unwrap_or_default()));
     Some(Track {
         id,
-        title,
-        artist,
-        album,
-        duration,
+        title: metadata.title,
+        artist: metadata.artist,
+        album: metadata.album,
+        duration: metadata.duration,
         file_path: Some(file_path.to_string_lossy().to_string()),
         is_stream: false,
         stream_url: None,
+        support_url: metadata.support_url,
+        track_number: metadata.track_number,
+        bitrate: metadata.bitrate,
+        sample_rate: metadata.sample_rate,
     })
 }
 
@@ -200,7 +258,9 @@ fn collect_files(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     if depth > 12 {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
@@ -214,7 +274,6 @@ fn collect_files(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Scans a folder and all its subfolders for audio files.
 pub fn scan_directory(dir: &Path) -> Vec<Track> {
     let mut files = Vec::new();
     collect_files(dir, 0, &mut files);
@@ -224,12 +283,12 @@ pub fn scan_directory(dir: &Path) -> Vec<Track> {
     tracks
 }
 
-pub fn ensure_library_dirs() -> (PathBuf, PathBuf) {
-    let demo_dir = PathBuf::from("demo_tracks");
-    let lib_dir = PathBuf::from("library");
-    let _ = fs::create_dir_all(&demo_dir);
-    let _ = fs::create_dir_all(&lib_dir);
-    (demo_dir, lib_dir)
+pub fn ensure_library_dir() -> PathBuf {
+    let library_dir = dirs::audio_dir()
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| data_dir().join("library"));
+    let _ = fs::create_dir_all(&library_dir);
+    library_dir
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -240,10 +299,8 @@ pub struct SavedLibrary {
     pub files: Vec<String>,
 }
 
-const STATE_FILE: &str = "library_state.json";
-
 pub fn load_saved() -> SavedLibrary {
-    fs::read_to_string(STATE_FILE)
+    fs::read_to_string(state_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -251,7 +308,7 @@ pub fn load_saved() -> SavedLibrary {
 
 pub fn save_saved(s: &SavedLibrary) {
     if let Ok(text) = serde_json::to_string_pretty(s) {
-        let _ = fs::write(STATE_FILE, text);
+        let _ = fs::write(state_path(), text);
     }
 }
 

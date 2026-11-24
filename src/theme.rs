@@ -14,6 +14,7 @@ pub enum PlayerTheme {
     SolarizedLight,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ThemePalette {
     pub name: &'static str,
@@ -89,7 +90,8 @@ impl PlayerTheme {
         match self {
             Self::CrtGreen => ThemePalette {
                 name: "CRT Green Phosphor",
-                description: "Authentic P1 phosphor monochrome CRT green terminal with intense glow",
+                description:
+                    "Authentic P1 phosphor monochrome CRT green terminal with intense glow",
                 is_dark: true,
                 is_crt: true,
                 bg_root: Color32::from_rgb(6, 12, 8),
@@ -118,7 +120,8 @@ impl PlayerTheme {
             },
             Self::CrtAmber => ThemePalette {
                 name: "CRT Amber Terminal",
-                description: "Warm P3 amber CRT cathode tube glow from vintage industrial workstations",
+                description:
+                    "Warm P3 amber CRT cathode tube glow from vintage industrial workstations",
                 is_dark: true,
                 is_crt: true,
                 bg_root: Color32::from_rgb(14, 10, 4),
@@ -234,7 +237,8 @@ impl PlayerTheme {
             },
             Self::OmarchyNord => ThemePalette {
                 name: "Omarchy Nord Frost",
-                description: "Cool Arctic palette with Nord dark slate and glacial ice blue accents",
+                description:
+                    "Cool Arctic palette with Nord dark slate and glacial ice blue accents",
                 is_dark: true,
                 is_crt: false,
                 bg_root: Color32::from_rgb(36, 41, 51),

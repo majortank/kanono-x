@@ -2,7 +2,7 @@
 
 ![Kanono X logo](resources/icons/kanono-x.svg)
 
-**Kanono X** is a Linux desktop audio player and local music library manager written in Rust. It combines a fast `egui` interface with Foobar2000-style folder navigation, a SQLite-backed catalog, configurable CRT and Omarchy-inspired themes, and optional YouTube search and MP3 conversion.
+**Kanono X** is a Linux desktop audio player and local music library manager written in Rust. It combines a fast `egui` interface with Foobar2000-style folder navigation, a SQLite-backed catalog, configurable CRT and Omarchy-inspired themes, legal Audius streaming, and opt-in user-configured external providers.
 
 [![CI](https://github.com/majortank/kanono-x/actions/workflows/ci.yml/badge.svg)](https://github.com/majortank/kanono-x/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -16,7 +16,9 @@
 - **Fast filtering and sorting** across title, artist, album, filename, and folder path.
 - **SQLite catalog** using WAL mode, indexed metadata queries, play counts, rescan support, and maintenance tools.
 - **Eight visual themes:** CRT Green, CRT Amber, CRT Cyber Cyan, Omarchy Emerald, Cyberpunk, Nord, Dracula, and Solarized.
-- **Optional YouTube tools** for searching, streaming, and converting a result to a local MP3 with `yt-dlp`.
+- **Legal discovery and streaming** through the public Audius API, with downloads gated by the artist's `is_downloadable` flag.
+- **Generic external providers** loaded from `~/.config/kanono-x/providers.toml`; no media service is hardcoded into the core.
+- **Artist support links** extracted from Audius profiles and local audio tags and opened in the system browser.
 - **Headless screenshot mode** for UI checks and automated visual capture.
 
 ### Supported audio formats
@@ -37,22 +39,21 @@ The library scanner recognizes MP3, WAV, FLAC, OGG, M4A, AAC, and Opus files. Ac
 
 - Linux with a working audio device
 - Rust and Cargo (Rust 1.75 or newer recommended)
-- FFmpeg and `ffprobe` for metadata probing and YouTube conversion
 - ALSA development libraries
-- `yt-dlp` (optional; required only for YouTube features)
+- FFmpeg is optional and only needed by external provider commands that you configure
 
 ### Debian/Ubuntu
 
 ```bash
-sudo apt install build-essential pkg-config libasound2-dev ffmpeg
-sudo apt install yt-dlp  # optional
+sudo apt install build-essential pkg-config libasound2-dev
+sudo apt install ffmpeg  # optional provider dependency
 ```
 
 ### Arch Linux
 
 ```bash
-sudo pacman -S base-devel pkgconf alsa-lib ffmpeg
-sudo pacman -S yt-dlp  # optional
+sudo pacman -S base-devel pkgconf alsa-lib
+sudo pacman -S ffmpeg  # optional provider dependency
 ```
 
 ## Build and run
@@ -63,12 +64,12 @@ cd kanono-x
 cargo run --release
 ```
 
-The application creates `demo_tracks/` and `library/` in its working directory when it starts. Add folders from the **Library** tab, or place compatible local audio in `library/` for a quick test. These directories are intentionally ignored by Git because they contain user media, not application source.
+The application scans `~/Music` by default when it exists. Add additional folders from the **Library** tab. If no audio directory exists, downloaded audio falls back to the application's local data directory.
 
 ### Command-line options
 
 ```text
---tab <nowplaying|library|youtube|settings>
+--tab <nowplaying|library|discover|providers|settings>
     Open a specific tab at startup.
 
 --screenshot <path.png>
@@ -88,18 +89,20 @@ Kanono X currently stores its runtime data relative to the directory from which 
 
 | Path | Purpose |
 |---|---|
-| `kanono_x_library.db` | SQLite library catalog |
-| `kanono_x_library.db-wal` / `kanono_x_library.db-shm` | SQLite WAL sidecar files |
-| `library_cache.json` | Cached local track metadata |
-| `library_state.json` | Saved library folders and files |
-| `library/` | Default local library and converted MP3 destination |
-| `demo_tracks/` | Optional bundled/demo track location |
+| `~/.local/share/kanono-x/kanono_x_library.db` | SQLite library catalog |
+| `~/.local/share/kanono-x/kanono_x_library.db-wal` / `.db-shm` | SQLite WAL sidecar files |
+| `~/.local/share/kanono-x/library_cache.json` | Cached local track metadata |
+| `~/.local/share/kanono-x/library_state.json` | Saved library folders and files |
+| `~/.config/kanono-x/providers.toml` | User-defined external provider commands |
+| `~/Music` | Default music directory when present |
 
 Do not commit personal music, generated databases, or cache files. The repository `.gitignore` already excludes these paths.
 
-## YouTube features and content responsibility
+## Legal streaming and external providers
 
-YouTube search, streaming, and conversion are optional integrations that invoke `yt-dlp` and external services. They are not required for local playback. Use them only for content you are authorized to access, download, or convert, and follow the terms and laws applicable to your location.
+Audius search and streaming use the public Audius REST API. Kanono X only shows **Download to Library** when Audius marks a track as downloadable. External providers are entirely user-configured and execute only commands that the user has installed and authorized. Use every source according to its terms and applicable law.
+
+On first launch, Kanono X creates a documented provider template at `~/.config/kanono-x/providers.toml`. Search commands should print tab-separated or newline-delimited JSON results; see the generated file for the supported placeholders and fields.
 
 ## Development
 
@@ -120,7 +123,8 @@ src/library.rs      Scanning, metadata loading, and local state
 src/library_db.rs   SQLite catalog and maintenance operations
 src/folder_tree.rs  Hierarchical folder filtering
 src/theme.rs        CRT and Omarchy-inspired palettes
-src/youtube.rs      Optional search, streaming, and conversion helpers
+src/providers.rs    Configured external provider commands
+src/audius.rs       Audius search, streaming, and permitted downloads
 ```
 
 See [`docs/ADVANCED_FEATURES.md`](docs/ADVANCED_FEATURES.md) for the design notes behind the performance, folder traversal, theme, and SQLite work.
@@ -128,8 +132,8 @@ See [`docs/ADVANCED_FEATURES.md`](docs/ADVANCED_FEATURES.md) for the design note
 ## Troubleshooting
 
 - **No audio:** verify the system audio service and ALSA development/runtime packages, then try a format supported by your installed backend.
-- **No metadata:** install `ffprobe` and confirm it is available on `PATH`.
-- **YouTube tools unavailable:** install `yt-dlp`; local playback and local library scanning work without it.
+- **No metadata:** Kanono X uses the pure-Rust `lofty` reader; confirm the file format is supported and the file is readable.
+- **Provider tools unavailable:** install the command named in your provider configuration; local playback, scanning, and Audius do not depend on external converters.
 - **Library appears empty:** launch the app from the directory containing your `library/` folder, or add a folder through the Library tab.
 
 ## Contributing

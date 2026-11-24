@@ -20,9 +20,15 @@ codegen-units = 1
 
 [dependencies]
 eframe = "0.31"
+dirs = "7"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+lofty = "0.25"
+open = "5"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
 rodio = { version = "0.23", default-features = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rfd = "0.18"
 rusqlite = { version = "0.32", features = ["bundled"] }
+shell-words = "1"
+toml = "0.9"

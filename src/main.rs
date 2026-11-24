@@ -1,10 +1,11 @@
 mod audio;
+mod audius;
 mod folder_tree;
 mod library;
 mod library_db;
+mod providers;
 mod theme;
 mod ui;
-mod youtube;
 
 use eframe::egui;
 use std::env;
@@ -22,7 +23,7 @@ fn main() -> eframe::Result<()> {
         } else if args[i] == "--tab" && i + 1 < args.len() {
             match args[i + 1].to_lowercase().as_str() {
                 "library" => initial_tab = ViewTab::Library,
-                "youtube" => initial_tab = ViewTab::YouTubeConverter,
+                "discover" | "providers" => initial_tab = ViewTab::Discover,
                 "settings" => initial_tab = ViewTab::Settings,
                 _ => initial_tab = ViewTab::NowPlaying,
             }

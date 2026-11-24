@@ -82,9 +82,10 @@ When enabled (`Settings > Enable Retro CRT Scanlines & Cathode Ray Overlay`), an
 ## 5. Resilient SQLite Media Catalog (WAL Mode)
 
 Metadata and library states are persisted via an embedded SQLite database (`rusqlite` bundled):
-- **Location**: `kanono_x_library.db` in the application's current working directory
+- **Location**: `~/.local/share/kanono-x/kanono_x_library.db` (via the platform's XDG data directory)
 - **Concurrency Mode**: `PRAGMA journal_mode = WAL;` (Write-Ahead Logging ensures concurrent read/write without UI locking).
 - **Synchronous Mode**: `PRAGMA synchronous = NORMAL;`
+- **Metadata Reader**: Pure-Rust `lofty` tag and audio-property parsing; no `ffprobe` subprocess is required.
 - **B-Tree Indexes**:
   - `idx_tracks_artist ON tracks(artist)`
   - `idx_tracks_album ON tracks(album)`

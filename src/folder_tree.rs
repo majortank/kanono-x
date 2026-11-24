@@ -31,9 +31,10 @@ impl FolderTreeNode {
         let first = &rel_components[0];
         let child_full_path = self.full_path.join(first);
 
-        let child = self.children.entry(first.clone()).or_insert_with(|| {
-            FolderTreeNode::new(first.clone(), child_full_path)
-        });
+        let child = self
+            .children
+            .entry(first.clone())
+            .or_insert_with(|| FolderTreeNode::new(first.clone(), child_full_path));
 
         child.insert_relative(&rel_components[1..], target_full_path);
     }
@@ -84,7 +85,10 @@ impl FolderHierarchy {
                     let root_path_str = format!("/{}", base_parts.join("/"));
                     let root_buf = PathBuf::from(&root_path_str);
                     let label = base_parts.last().copied().unwrap_or("Music").to_string();
-                    let rel = parent.strip_prefix(&root_buf).unwrap_or(Path::new("")).to_path_buf();
+                    let rel = parent
+                        .strip_prefix(&root_buf)
+                        .unwrap_or(Path::new(""))
+                        .to_path_buf();
                     (label, root_buf, rel)
                 } else {
                     (parent_str.to_string(), parent_buf.clone(), PathBuf::new())
@@ -93,18 +97,34 @@ impl FolderHierarchy {
                 let parts: Vec<&str> = parent_str.split('/').filter(|s| !s.is_empty()).collect();
                 let label = parts.first().copied().unwrap_or("Root").to_string();
                 let root_buf = PathBuf::from(format!("/{}", label));
-                let rel = parent.strip_prefix(&root_buf).unwrap_or(Path::new("")).to_path_buf();
+                let rel = parent
+                    .strip_prefix(&root_buf)
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf();
                 (label, root_buf, rel)
             } else {
-                // Relative path like "demo_tracks" or "library"
-                let first = parent_str.split('/').next().unwrap_or("library").to_string();
+                // Relative paths are grouped by their first directory component.
+                let first = parent_str
+                    .split('/')
+                    .next()
+                    .unwrap_or("library")
+                    .to_string();
                 let root_buf = PathBuf::from(&first);
-                let rel = parent.strip_prefix(&root_buf).unwrap_or(Path::new("")).to_path_buf();
+                let rel = parent
+                    .strip_prefix(&root_buf)
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf();
                 (first.clone(), root_buf, rel)
             };
 
             let root_node = self.roots.entry(root_label).or_insert_with(|| {
-                FolderTreeNode::new(root_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "Root".to_string()), root_dir.clone())
+                FolderTreeNode::new(
+                    root_dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Root".to_string()),
+                    root_dir.clone(),
+                )
             });
 
             let rel_components: Vec<String> = rel_path
