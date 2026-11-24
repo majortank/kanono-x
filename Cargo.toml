@@ -1,0 +1,28 @@
+[package]
+name = "kanono-x"
+version = "0.2.0"
+edition = "2021"
+authors = ["Thabo Tankiso Thebe <majortank>"]
+description = "Kanono X — Advanced Hi-Fi Audio Workstation with Foobar2000-style folder traversal, SQLite WAL catalog, and Omarchy/CRT themes"
+license = "MIT"
+repository = "https://github.com/majortank/kanono-x"
+readme = "README.md"
+keywords = ["audio", "player", "music", "foobar2000", "sqlite"]
+categories = ["multimedia::audio"]
+
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[dependencies]
+eframe = "0.31"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rodio = { version = "0.23", default-features = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rfd = "0.18"
+rusqlite = { version = "0.32", features = ["bundled"] }

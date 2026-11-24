@@ -1,0 +1,8 @@
+/target
+library/
+demo_tracks/
+*.db
+*.db-wal
+*.db-shm
+library_cache.json
+library_state.json
