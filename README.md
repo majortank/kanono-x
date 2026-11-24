@@ -104,6 +104,8 @@ Audius search and streaming use the public Audius REST API. Kanono X only shows 
 
 On first launch, Kanono X creates a documented provider template at `~/.config/kanono-x/providers.toml`. Search commands should print tab-separated or newline-delimited JSON results; see the generated file for the supported placeholders and fields.
 
+The **Discover / Providers** view includes a provider manager for adding, editing, deleting, reloading, and selecting providers without manually editing TOML. It can check whether configured commands are installed, open the configuration folder, and copy platform-specific installation commands for tools such as `yt-dlp` and `ffmpeg`. Kanono X does not silently install packages or run privileged commands.
+
 ## Development
 
 Format and check the project before opening a change:

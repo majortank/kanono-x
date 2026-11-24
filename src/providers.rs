@@ -89,6 +89,53 @@ pub fn load_configured_providers() -> Result<Vec<Provider>, String> {
     Ok(config.providers)
 }
 
+pub fn save_configured_providers(providers: &[Provider]) -> Result<(), String> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Could not create {}: {}", parent.display(), e))?;
+    }
+    let config = ProviderConfig {
+        providers: providers.to_vec(),
+    };
+    let text = toml::to_string_pretty(&config)
+        .map_err(|e| format!("Could not serialize provider configuration: {}", e))?;
+    fs::write(&path, text).map_err(|e| format!("Could not write {}: {}", path.display(), e))
+}
+
+pub fn check_command(template: &str) -> Result<String, String> {
+    let parts = split(template).map_err(|e| format!("Invalid command: {}", e))?;
+    let program = parts
+        .first()
+        .ok_or_else(|| "Command is empty".to_string())?;
+    let output = Command::new(program)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("{} is not available: {}", program, e))?;
+    if !output.status.success() {
+        return Err(format!("{} did not accept --version", program));
+    }
+    let version = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(&output.stderr).lines())
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("installed")
+        .trim()
+        .to_string();
+    Ok(version)
+}
+
+pub fn installation_commands() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("Debian / Ubuntu", "sudo apt install yt-dlp ffmpeg"),
+        ("Arch Linux", "sudo pacman -S yt-dlp ffmpeg"),
+        (
+            "Python user install",
+            "python3 -m pip install --user yt-dlp",
+        ),
+    ]
+}
+
 fn write_template(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

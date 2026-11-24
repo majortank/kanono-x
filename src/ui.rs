@@ -122,6 +122,12 @@ pub struct KanonoApp {
     pub discover_status_message: String,
     pub downloaded_history: Vec<Track>,
     pub provider_config_error: Option<String>,
+    pub provider_editor_index: Option<usize>,
+    pub provider_name_input: String,
+    pub provider_search_cmd_input: String,
+    pub provider_stream_cmd_input: String,
+    pub provider_download_cmd_input: String,
+    pub provider_tool_status: Option<String>,
 
     // Channels for background tasks
     pub bg_sender: Sender<BgTaskMsg>,
@@ -223,6 +229,12 @@ impl KanonoApp {
             discover_status_message: "Ready to search Audius or a configured provider.".to_string(),
             downloaded_history: Vec::new(),
             provider_config_error,
+            provider_editor_index: None,
+            provider_name_input: String::new(),
+            provider_search_cmd_input: String::new(),
+            provider_stream_cmd_input: String::new(),
+            provider_download_cmd_input: String::new(),
+            provider_tool_status: None,
 
             bg_sender,
             bg_receiver,
@@ -487,6 +499,115 @@ impl KanonoApp {
                 PlayerTheme::SolarizedLight => "SolarizedLight",
             },
         );
+    }
+
+    fn clear_provider_editor(&mut self) {
+        self.provider_editor_index = None;
+        self.provider_name_input.clear();
+        self.provider_search_cmd_input.clear();
+        self.provider_stream_cmd_input.clear();
+        self.provider_download_cmd_input.clear();
+        self.provider_tool_status = None;
+    }
+
+    fn edit_provider(&mut self, index: usize) {
+        if let Some(provider) = self.providers.get(index) {
+            self.provider_editor_index = Some(index);
+            self.provider_name_input = provider.name.clone();
+            self.provider_search_cmd_input = provider.search_cmd.clone().unwrap_or_default();
+            self.provider_stream_cmd_input = provider.stream_cmd.clone().unwrap_or_default();
+            self.provider_download_cmd_input = provider.download_cmd.clone().unwrap_or_default();
+            self.provider_tool_status = None;
+        }
+    }
+
+    fn save_provider_from_editor(&mut self) {
+        let name = self.provider_name_input.trim().to_string();
+        if name.is_empty() {
+            self.provider_tool_status = Some("Enter a provider name first.".to_string());
+            return;
+        }
+        let provider = Provider {
+            name,
+            search_cmd: non_empty(&self.provider_search_cmd_input),
+            stream_cmd: non_empty(&self.provider_stream_cmd_input),
+            download_cmd: non_empty(&self.provider_download_cmd_input),
+        };
+        if let Some(index) = self.provider_editor_index {
+            if let Some(existing) = self.providers.get_mut(index) {
+                *existing = provider;
+            }
+        } else {
+            self.providers.push(provider);
+        }
+
+        match providers::save_configured_providers(&self.providers) {
+            Ok(()) => {
+                self.provider_config_error = None;
+                self.provider_tool_status =
+                    Some("Provider saved. Select it above to use it.".to_string());
+                self.clear_provider_editor();
+            }
+            Err(error) => self.provider_config_error = Some(error),
+        }
+    }
+
+    fn delete_provider(&mut self, index: usize) {
+        if index < self.providers.len() {
+            self.providers.remove(index);
+            if self.active_provider == Some(index) {
+                self.active_provider = None;
+            } else if self.active_provider.is_some_and(|active| active > index) {
+                self.active_provider = self.active_provider.map(|active| active - 1);
+            }
+            if let Err(error) = providers::save_configured_providers(&self.providers) {
+                self.provider_config_error = Some(error);
+            } else {
+                self.clear_provider_editor();
+            }
+        }
+    }
+
+    fn reload_providers(&mut self) {
+        match providers::load_configured_providers() {
+            Ok(providers) => {
+                self.providers = providers;
+                self.active_provider = None;
+                self.provider_config_error = None;
+                self.clear_provider_editor();
+                self.provider_tool_status = Some("Provider configuration reloaded.".to_string());
+            }
+            Err(error) => self.provider_config_error = Some(error),
+        }
+    }
+
+    fn check_provider_tools(&mut self) {
+        let Some(index) = self.provider_editor_index else {
+            self.provider_tool_status = Some("Select or edit a provider first.".to_string());
+            return;
+        };
+        let Some(provider) = self.providers.get(index) else {
+            self.provider_tool_status = Some("Provider no longer exists.".to_string());
+            return;
+        };
+        let mut results = Vec::new();
+        for (label, command) in [
+            ("search", provider.search_cmd.as_deref()),
+            ("stream", provider.stream_cmd.as_deref()),
+            ("download", provider.download_cmd.as_deref()),
+        ] {
+            if let Some(command) = command {
+                match providers::check_command(command) {
+                    Ok(version) => results.push(format!("{label}: {version}")),
+                    Err(error) => results.push(format!("{label}: {error}")),
+                }
+            }
+        }
+        self.provider_tool_status = Some(if results.is_empty() {
+            "This provider has no commands configured.".to_string()
+        } else {
+            results.join(" | ")
+        });
     }
 
     pub fn start_discover_search(&mut self) {
@@ -2029,6 +2150,111 @@ impl KanonoApp {
             ui.colored_label(p.accent, format!("Provider configuration: {}", error));
         }
 
+        let mut provider_to_edit = None;
+        let mut provider_to_delete = None;
+        ui.collapsing("⚙ Manage external providers", |ui| {
+            ui.label("Add tools such as a downloader or converter by installing them on your system, then defining their commands here.");
+            ui.label(RichText::new("Commands run only when you choose a provider action. Placeholders: {query}, {url}, {output_dir}.").color(p.text_muted));
+
+            ui.horizontal(|ui| {
+                if ui.button("＋ New provider").clicked() {
+                    self.clear_provider_editor();
+                }
+                if ui.button("↻ Reload").clicked() {
+                    self.reload_providers();
+                }
+                if ui.button("📂 Open config folder").clicked() {
+                    if let Some(folder) = providers::config_path().parent() {
+                        if let Err(error) = open::that(folder) {
+                            self.provider_tool_status =
+                                Some(format!("Could not open config folder: {}", error));
+                        }
+                    }
+                }
+            });
+
+            if !self.providers.is_empty() {
+                ui.add_space(4.0);
+                let provider_rows: Vec<(usize, String, bool)> = self
+                    .providers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, provider)| {
+                        (
+                            index,
+                            provider.name.clone(),
+                            self.active_provider == Some(index),
+                        )
+                    })
+                    .collect();
+                for (index, name, active) in provider_rows {
+                    ui.horizontal(|ui| {
+                        ui.label(if active { "●" } else { "○" });
+                        ui.label(name);
+                        if ui.small_button("Use").clicked() {
+                            self.active_provider = Some(index);
+                        }
+                        if ui.small_button("Edit").clicked() {
+                            provider_to_edit = Some(index);
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            provider_to_delete = Some(index);
+                        }
+                    });
+                }
+            }
+
+            ui.separator();
+            ui.label(RichText::new("Provider definition").strong());
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut self.provider_name_input));
+            });
+            ui.label("Search command (prints tab-separated or JSON results)");
+            ui.add(egui::TextEdit::singleline(&mut self.provider_search_cmd_input).desired_width(f32::INFINITY));
+            ui.label("Stream command (prints a playable HTTP URL)");
+            ui.add(egui::TextEdit::singleline(&mut self.provider_stream_cmd_input).desired_width(f32::INFINITY));
+            ui.label("Download command (prints the output path or writes into {output_dir})");
+            ui.add(egui::TextEdit::singleline(&mut self.provider_download_cmd_input).desired_width(f32::INFINITY));
+
+            ui.horizontal(|ui| {
+                if ui.button("💾 Save provider").clicked() {
+                    self.save_provider_from_editor();
+                }
+                if self.provider_editor_index.is_some()
+                    && ui.button("✓ Check installed tools").clicked()
+                {
+                    self.check_provider_tools();
+                }
+                if self.provider_editor_index.is_some() && ui.button("Clear editor").clicked() {
+                    self.clear_provider_editor();
+                }
+            });
+            if let Some(status) = &self.provider_tool_status {
+                ui.label(RichText::new(status).color(p.accent));
+            }
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("Install common tools").strong());
+            for (platform, command) in providers::installation_commands() {
+                ui.horizontal(|ui| {
+                    ui.label(*platform);
+                    if ui.small_button("Copy command").clicked() {
+                        ui.ctx().copy_text((*command).to_string());
+                        self.provider_tool_status = Some(format!("Copied: {}", command));
+                    }
+                    ui.monospace(*command);
+                });
+            }
+        });
+        if let Some(index) = provider_to_edit {
+            self.edit_provider(index);
+        }
+        if let Some(index) = provider_to_delete {
+            self.delete_provider(index);
+        }
+
+        ui.add_space(8.0);
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.label("Source:");
@@ -2323,4 +2549,9 @@ fn shorten_end(s: &str, max: usize) -> String {
     }
     let head: String = s.chars().take(max - 2).collect();
     format!("{}...", head)
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
