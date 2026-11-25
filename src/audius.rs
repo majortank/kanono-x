@@ -1,4 +1,7 @@
 use crate::library::Track;
+use crate::library_db::{
+    DownloadDisposition, DownloadResult, DuplicateCandidate, DuplicatePolicy, LibraryDb,
+};
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,6 +53,7 @@ impl AudiusItem {
     }
 
     pub fn to_track(&self, file_path: Option<String>) -> Track {
+        let is_stream = file_path.is_none();
         Track {
             id: format!("audius:{}", self.id),
             title: self.title.clone(),
@@ -57,12 +61,15 @@ impl AudiusItem {
             album: self.album.clone(),
             duration: self.duration,
             file_path,
-            is_stream: true,
+            is_stream,
             stream_url: Some(self.stream_url.clone()),
             support_url: self.support_url.clone(),
             track_number: None,
             bitrate: None,
             sample_rate: None,
+            musicbrainz_recording_id: None,
+            isrc: None,
+            fingerprint: None,
         }
     }
 }
@@ -112,18 +119,86 @@ pub fn stream_to_cache(item: &AudiusItem) -> Result<Track, String> {
     Ok(item.to_track(Some(path.to_string_lossy().to_string())))
 }
 
-pub fn download_to_library(item: &AudiusItem, library_dir: &Path) -> Result<Track, String> {
+pub fn download_to_library(
+    item: &AudiusItem,
+    library_dir: &Path,
+) -> Result<DownloadResult, String> {
     if !item.is_downloadable {
         return Err("The artist has not marked this track as downloadable".to_string());
     }
     fs::create_dir_all(library_dir).map_err(|e| format!("Could not create music folder: {}", e))?;
-    let filename = format!("{} - {}.mp3", sanitize(&item.artist), sanitize(&item.title));
-    let path = unique_path(library_dir, &filename);
+    let db =
+        LibraryDb::open_default().map_err(|e| format!("Could not open library index: {}", e))?;
+    let matches = db
+        .find_duplicates(&DuplicateCandidate {
+            title: item.title.clone(),
+            artist: item.artist.clone(),
+            album: Some(item.album.clone()),
+            duration: item.duration,
+            ..Default::default()
+        })
+        .map_err(|e| format!("Could not query library index: {}", e))?;
+    let existing = match matches.as_slice() {
+        [] => None,
+        [single] => Some(single.clone()),
+        _ => {
+            return Err(format!(
+                "Ambiguous existing matches for '{}'; no download was started",
+                item.title
+            ))
+        }
+    };
+    match (db.duplicate_policy(), existing.as_ref()) {
+        (DuplicatePolicy::Skip, Some(existing)) => {
+            return Ok(DownloadResult {
+                track: existing.track.clone(),
+                disposition: DownloadDisposition::Reused,
+                existing_path: existing.track.file_path.clone(),
+                reason: Some(existing.reason.label().to_string()),
+            });
+        }
+        (DuplicatePolicy::Ask, Some(existing)) => {
+            return Err(format!(
+                "Existing track found at {}; change Duplicate policy to Allow or Replace to continue",
+                existing
+                    .track
+                    .file_path
+                    .as_deref()
+                    .unwrap_or("unknown path")
+            ));
+        }
+        _ => {}
+    }
+    let album = if item.album.trim().is_empty() || item.album.eq_ignore_ascii_case("audius") {
+        "Singles"
+    } else {
+        item.album.as_str()
+    };
+    let album_dir = library_dir
+        .join(sanitize_component(&item.artist, "Unknown Artist"))
+        .join(sanitize_component(album, "Singles"));
+    fs::create_dir_all(&album_dir).map_err(|e| format!("Could not create album folder: {}", e))?;
+    let filename = format!("{}.mp3", sanitize(&item.title));
+    let path = if db.duplicate_policy() == DuplicatePolicy::Replace {
+        existing
+            .as_ref()
+            .and_then(|matched| matched.track.file_path.as_deref())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| unique_path(&album_dir, &filename))
+    } else {
+        unique_path(&album_dir, &filename)
+    };
     download_bytes(&item.stream_url, &path)?;
     let mut track = crate::library::load_local_track(&path)
         .ok_or_else(|| "Downloaded track could not be parsed".to_string())?;
     track.support_url = item.support_url.clone();
-    Ok(track)
+    track.album = album.to_string();
+    Ok(DownloadResult {
+        track,
+        disposition: DownloadDisposition::Downloaded,
+        existing_path: existing.and_then(|matched| matched.track.file_path),
+        reason: None,
+    })
 }
 
 fn resolve_api_host(client: &reqwest::blocking::Client) -> String {
@@ -225,6 +300,27 @@ fn sanitize(value: &str) -> String {
         "track".to_string()
     } else {
         output
+    }
+}
+
+fn sanitize_component(value: &str, fallback: &str) -> String {
+    let output: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || matches!(character, ' ' | '-' | '_' | '(' | ')' | '[' | ']')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let output = output.trim();
+    if output.is_empty() {
+        fallback.to_string()
+    } else {
+        output.to_string()
     }
 }
 

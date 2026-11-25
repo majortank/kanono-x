@@ -96,6 +96,28 @@ Metadata and library states are persisted via an embedded SQLite database (`rusq
 - **Rescan All Catalog Tracks**: Re-reads audio file tags and updates the database.
 - **Folder Manager**: Add and remove indexed source directories with automatic track cleanup.
 
+### Persistent duplicate index
+
+Download preflight uses the same SQLite catalog to avoid unnecessary network transfers:
+
+- Local tracks store file size and modification time, normalized artist/title/album keys, track number, MusicBrainz recording ID, ISRC, and an optional `fpcalc` fingerprint.
+- Rescans upsert new and modified files and remove missing files under the scanned roots; downloads query the index without a full filesystem scan.
+- Matching is conservative. Exact identifiers and fingerprints have priority, while metadata matching requires normalized artist/title, compatible version markers, and duration within 3% or two seconds.
+- Multiple plausible metadata matches are treated as ambiguous and block automatic reuse.
+
+The duplicate policy is stored in the `app_settings` table under `duplicate_policy`. The default is `skip`. Provider and Audius downloads stage files first, then move them into `Artist/Album`; missing album metadata uses `Artist/Singles`.
+
+### Provider album fields
+
+Provider tab output accepts these tab-separated fields:
+
+```text
+id, title, artist, duration_seconds, url, downloadable, support_url,
+album, playlist, track_number
+```
+
+For yt-dlp, album and playlist metadata are read during result resolution. The album is preferred, with the playlist name used as a fallback for playlist and album URLs. Batch downloads process each result independently, so existing tracks can be reused without redownloading the rest of the playlist.
+
 ---
 
 ## 6. How to Run

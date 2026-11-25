@@ -7,7 +7,7 @@ use crate::audio::{AudioEngine, RepeatMode};
 use crate::audius::{self, AudiusItem};
 use crate::folder_tree::{FolderHierarchy, FolderTreeNode};
 use crate::library::{format_time, scan_directory, Track};
-use crate::library_db::{DbStats, LibraryDb};
+use crate::library_db::{DbStats, DownloadDisposition, DownloadResult, DuplicatePolicy, LibraryDb};
 use crate::providers::{self, Provider, ProviderItem};
 use crate::theme::{PlayerTheme, ThemePalette};
 
@@ -74,9 +74,10 @@ pub enum SidebarMode {
 
 pub enum BgTaskMsg {
     SearchComplete(Result<DiscoverResults, String>),
-    DownloadComplete(Result<Track, String>),
+    DownloadComplete(Result<DownloadResult, String>),
+    DownloadBatchComplete(Vec<Result<DownloadResult, String>>),
     StreamComplete(Result<Track, String>),
-    Scanned(Vec<Track>, String),
+    Scanned(Vec<Track>, Vec<PathBuf>, String),
 }
 
 pub enum DiscoverResults {
@@ -98,6 +99,7 @@ pub struct KanonoApp {
     // SQLite Database
     pub db: LibraryDb,
     pub db_stats: DbStats,
+    pub duplicate_policy: DuplicatePolicy,
 
     // Foobar Folder Traversal & Filtering
     pub folder_tree: FolderHierarchy,
@@ -191,6 +193,7 @@ impl KanonoApp {
         }
 
         let db_stats = db.get_stats();
+        let duplicate_policy = db.duplicate_policy();
 
         // Load cached tracks from SQLite
         let initial_tracks = db.load_all_tracks().unwrap_or_default();
@@ -207,6 +210,7 @@ impl KanonoApp {
 
             db,
             db_stats,
+            duplicate_policy,
 
             folder_tree: FolderHierarchy::new(),
             sidebar_mode: SidebarMode::FolderTree,
@@ -274,6 +278,7 @@ impl KanonoApp {
     fn start_scan(&mut self, dirs: Vec<PathBuf>, files: Vec<PathBuf>, label: String) {
         self.scanning += 1;
         let sender = self.bg_sender.clone();
+        let scan_roots = dirs.clone();
         thread::spawn(move || {
             let mut tracks = Vec::new();
             for d in dirs {
@@ -285,16 +290,17 @@ impl KanonoApp {
                 }
             }
             crate::library::flush_cache();
-            let _ = sender.send(BgTaskMsg::Scanned(tracks, label));
+            let _ = sender.send(BgTaskMsg::Scanned(tracks, scan_roots, label));
         });
     }
 
-    fn finish_scan(&mut self, tracks: Vec<Track>, label: String) {
+    fn finish_scan(&mut self, tracks: Vec<Track>, roots: Vec<PathBuf>, label: String) {
         self.scanning = self.scanning.saturating_sub(1);
         let found = tracks.len();
 
         // Upsert to SQLite WAL database
         let _ = self.db.upsert_tracks_batch(&tracks);
+        let _ = self.db.prune_missing_under(&roots);
         self.db_stats = self.db.get_stats();
 
         let added = self.add_tracks(tracks);
@@ -641,6 +647,12 @@ impl KanonoApp {
         if !item.is_downloadable {
             return;
         }
+        if self.scanning > 0 {
+            self.discover_status_message =
+                "Library scan in progress; download is paused until the index is current."
+                    .to_string();
+            return;
+        }
         self.discover_is_downloading = true;
         self.discover_status_message =
             format!("Downloading '{}' to your music library...", item.title);
@@ -682,6 +694,12 @@ impl KanonoApp {
         if !item.downloadable {
             return;
         }
+        if self.scanning > 0 {
+            self.discover_status_message =
+                "Library scan in progress; download is paused until the index is current."
+                    .to_string();
+            return;
+        }
         self.discover_is_downloading = true;
         self.discover_status_message =
             format!("Downloading '{}' to your music library...", item.title);
@@ -694,10 +712,31 @@ impl KanonoApp {
         });
     }
 
+    pub fn start_provider_batch_download(&mut self, provider: Provider, items: Vec<ProviderItem>) {
+        if items.is_empty() {
+            return;
+        }
+        if self.scanning > 0 {
+            self.discover_status_message =
+                "Library scan in progress; download is paused until the index is current."
+                    .to_string();
+            return;
+        }
+        self.discover_is_downloading = true;
+        self.discover_status_message =
+            format!("Checking {} tracks against your library...", items.len());
+        let sender = self.bg_sender.clone();
+        let library_dir = self.library_dir.clone();
+        thread::spawn(move || {
+            let results = providers::download_many(&provider, &items, &library_dir);
+            let _ = sender.send(BgTaskMsg::DownloadBatchComplete(results));
+        });
+    }
+
     pub fn process_bg_messages(&mut self) {
         while let Ok(msg) = self.bg_receiver.try_recv() {
             match msg {
-                BgTaskMsg::Scanned(tracks, label) => self.finish_scan(tracks, label),
+                BgTaskMsg::Scanned(tracks, roots, label) => self.finish_scan(tracks, roots, label),
                 BgTaskMsg::SearchComplete(res) => {
                     self.discover_is_searching = false;
                     match res {
@@ -724,22 +763,80 @@ impl KanonoApp {
                 BgTaskMsg::DownloadComplete(res) => {
                     self.discover_is_downloading = false;
                     match res {
-                        Ok(track) => {
-                            let title = track.title.clone();
-                            self.discover_status_message =
-                                format!("Downloaded '{}' and added it to the library.", title);
-                            let _ = self.db.upsert_track(&track);
+                        Ok(result) => {
+                            let title = result.track.title.clone();
+                            let _ = self.db.upsert_track(&result.track);
                             self.db_stats = self.db.get_stats();
-                            self.downloaded_history.push(track.clone());
-                            self.playlist.push(track);
+                            self.downloaded_history.push(result.track.clone());
+                            if !self
+                                .playlist
+                                .iter()
+                                .any(|track| track.id == result.track.id)
+                            {
+                                self.playlist.push(result.track.clone());
+                            }
                             self.rebuild_folder_tree();
-                            self.show_toast(format!("Added to Library: {}", title));
+                            match result.disposition {
+                                DownloadDisposition::Downloaded => {
+                                    self.discover_status_message = format!(
+                                        "Downloaded '{}' and added it to the library.",
+                                        title
+                                    );
+                                    self.show_toast(format!("Downloaded: {}", title));
+                                }
+                                DownloadDisposition::Reused => {
+                                    let path = result
+                                        .existing_path
+                                        .as_deref()
+                                        .unwrap_or("existing library file");
+                                    let reason =
+                                        result.reason.as_deref().unwrap_or("duplicate match");
+                                    self.discover_status_message = format!(
+                                        "Skipped '{}' — reused {} ({})",
+                                        title, path, reason
+                                    );
+                                    self.show_toast(format!("Reused existing track: {}", title));
+                                }
+                            }
                         }
                         Err(e) => {
                             self.discover_status_message = format!("Download error: {}", e);
                             self.show_toast(format!("Download failed: {}", e));
                         }
                     }
+                }
+                BgTaskMsg::DownloadBatchComplete(results) => {
+                    self.discover_is_downloading = false;
+                    let mut downloaded = 0;
+                    let mut reused = 0;
+                    let mut failed = 0;
+                    for result in results {
+                        match result {
+                            Ok(result) => {
+                                match result.disposition {
+                                    DownloadDisposition::Downloaded => downloaded += 1,
+                                    DownloadDisposition::Reused => reused += 1,
+                                }
+                                let _ = self.db.upsert_track(&result.track);
+                                if !self
+                                    .playlist
+                                    .iter()
+                                    .any(|track| track.id == result.track.id)
+                                {
+                                    self.playlist.push(result.track.clone());
+                                }
+                                self.downloaded_history.push(result.track);
+                            }
+                            Err(_) => failed += 1,
+                        }
+                    }
+                    self.db_stats = self.db.get_stats();
+                    self.rebuild_folder_tree();
+                    self.discover_status_message = format!(
+                        "Playlist complete: {} downloaded, {} reused, {} failed.",
+                        downloaded, reused, failed
+                    );
+                    self.show_toast(self.discover_status_message.clone());
                 }
                 BgTaskMsg::StreamComplete(res) => match res {
                     Ok(track) => {
@@ -2391,9 +2488,18 @@ impl KanonoApp {
                 ui.heading("Provider results");
                 let mut stream_target = None;
                 let mut download_target = None;
+                let mut download_all = false;
                 let provider = self
                     .active_provider
                     .and_then(|index| self.providers.get(index).cloned());
+                if self.provider_results.len() > 1 {
+                    if ui
+                        .button("📥 Download all results (reuse existing)")
+                        .clicked()
+                    {
+                        download_all = true;
+                    }
+                }
                 for item in &self.provider_results {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
@@ -2425,8 +2531,13 @@ impl KanonoApp {
                 if let Some((item, provider)) = stream_target.zip(provider.clone()) {
                     self.start_provider_stream(provider, item);
                 }
-                if let Some((item, provider)) = download_target.zip(provider) {
+                if let Some((item, provider)) = download_target.zip(provider.clone()) {
                     self.start_provider_download(provider, item);
+                }
+                if download_all {
+                    if let Some(provider) = provider {
+                        self.start_provider_batch_download(provider, self.provider_results.clone());
+                    }
                 }
             }
 
@@ -2524,6 +2635,29 @@ impl KanonoApp {
                         }
                     }
                 });
+            });
+
+            ui.add_space(10.0);
+
+            ui.group(|ui| {
+                ui.heading("♻ Duplicate Download Policy");
+                ui.label("The indexed library is checked before every provider download.");
+                for policy in [
+                    DuplicatePolicy::Skip,
+                    DuplicatePolicy::Ask,
+                    DuplicatePolicy::Allow,
+                    DuplicatePolicy::Replace,
+                ] {
+                    if ui
+                        .selectable_label(self.duplicate_policy == policy, policy.label())
+                        .clicked()
+                    {
+                        self.duplicate_policy = policy;
+                        let _ = self.db.set_setting("duplicate_policy", policy.as_str());
+                        self.show_toast(format!("Duplicate policy: {}", policy.label()));
+                    }
+                }
+                ui.small("Matching is conservative: identifiers, optional fpcalc fingerprints, then normalized metadata and duration.");
             });
 
             ui.add_space(10.0);

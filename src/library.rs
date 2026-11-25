@@ -23,6 +23,12 @@ pub struct Track {
     pub bitrate: Option<u32>,
     #[serde(default)]
     pub sample_rate: Option<u32>,
+    #[serde(default)]
+    pub musicbrainz_recording_id: Option<String>,
+    #[serde(default)]
+    pub isrc: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl Track {
@@ -48,14 +54,20 @@ pub fn format_time(seconds: f32) -> String {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Metadata {
-    title: String,
-    artist: String,
-    album: String,
-    duration: f32,
-    track_number: Option<u32>,
-    bitrate: Option<u32>,
-    sample_rate: Option<u32>,
-    support_url: Option<String>,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration: f32,
+    pub track_number: Option<u32>,
+    pub bitrate: Option<u32>,
+    pub sample_rate: Option<u32>,
+    pub support_url: Option<String>,
+    #[serde(default)]
+    pub musicbrainz_recording_id: Option<String>,
+    #[serde(default)]
+    pub isrc: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -152,6 +164,9 @@ fn read_metadata(file_path: &Path) -> Metadata {
         bitrate: None,
         sample_rate: None,
         support_url: None,
+        musicbrainz_recording_id: None,
+        isrc: None,
+        fingerprint: None,
     };
 
     let Ok(tagged_file) = read_from_path(file_path) else {
@@ -189,9 +204,34 @@ fn read_metadata(file_path: &Path) -> Metadata {
             .items()
             .map(|item| format!("{:?}", item.value()))
             .find_map(|value| find_http_url(&value));
+        metadata.musicbrainz_recording_id = tag
+            .get_string(ItemKey::MusicBrainzRecordingId)
+            .map(str::to_owned)
+            .filter(|value| !value.trim().is_empty());
+        metadata.isrc = tag
+            .get_string(ItemKey::Isrc)
+            .map(str::to_owned)
+            .filter(|value| !value.trim().is_empty());
     }
 
+    metadata.fingerprint = audio_fingerprint(file_path);
     metadata
+}
+
+fn audio_fingerprint(file_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("fpcalc")
+        .args(["-json", "-length", "120"])
+        .arg(file_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        .ok()?
+        .get("fingerprint")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 fn find_http_url(value: &str) -> Option<String> {
@@ -221,6 +261,9 @@ pub fn load_local_track(file_path: &Path) -> Option<Track> {
         track_number: metadata.track_number,
         bitrate: metadata.bitrate,
         sample_rate: metadata.sample_rate,
+        musicbrainz_recording_id: metadata.musicbrainz_recording_id,
+        isrc: metadata.isrc,
+        fingerprint: metadata.fingerprint,
     })
 }
 

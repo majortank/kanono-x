@@ -15,6 +15,8 @@
 - **Foobar-style library navigation** with a hierarchical folder tree, breadcrumbs, expandable folders, and an include-subfolders toggle.
 - **Fast filtering and sorting** across title, artist, album, filename, and folder path.
 - **SQLite catalog** using WAL mode, indexed metadata queries, play counts, rescan support, and maintenance tools.
+- **Library-aware duplicate protection** with persistent matching by MusicBrainz recording ID, ISRC, optional `fpcalc` fingerprint, and conservative normalized metadata/duration checks.
+- **Organized downloads** stored as `Artist/Album/track.ext`; tracks without album metadata use `Artist/Singles` instead of an `Unknown Album` folder.
 - **Eight visual themes:** CRT Green, CRT Amber, CRT Cyber Cyan, Omarchy Emerald, Cyberpunk, Nord, Dracula, and Solarized.
 - **Legal discovery and streaming** through the public Audius API, with downloads gated by the artist's `is_downloadable` flag.
 - **Generic external providers** loaded from `~/.config/kanono-x/providers.toml`; no media service is hardcoded into the core.
@@ -41,6 +43,7 @@ The library scanner recognizes MP3, WAV, FLAC, OGG, M4A, AAC, and Opus files. Ac
 - Rust and Cargo (Rust 1.75 or newer recommended)
 - ALSA development libraries
 - FFmpeg is optional and only needed by external provider commands that you configure
+- `fpcalc` is optional and enables local audio fingerprint matching when installed
 
 ### Debian/Ubuntu
 
@@ -109,10 +112,31 @@ The **Discover / Providers** view includes a provider manager for adding, editin
 For first-time setup, open **Discover / Providers**, choose **Start from an example**, and load the recipe matching the tool you installed. Replace the command fields only when needed, click **Check installed tools**, then save the provider. The form explains that `{query}` is the search text, `{url}` is a result URL, and `{output_dir}` is the music-library folder. Search output must contain tab-separated fields in this order:
 
 ```text
-id    title    artist    duration_seconds    url    downloadable    support_url
+id    title    artist    duration_seconds    url    downloadable    support_url    album    playlist    track_number
 ```
 
 Set `downloadable` to `true` only when the source explicitly permits downloading; otherwise leave it `false`. Streaming does not require a download command.
+
+### Duplicate detection and download policies
+
+Before any Audius or external-provider download, Kanono X queries its persistent SQLite catalog instead of scanning the entire music library. Matching is conservative and ordered by:
+
+1. MusicBrainz recording ID
+2. ISRC
+3. Optional local `fpcalc` fingerprint
+4. Normalized artist/title plus a strict duration tolerance
+5. Album and track number as supporting metadata
+
+Live, remix, acoustic, remaster, demo, and similar version markers are not treated as identical. Ambiguous matches stop the download rather than silently skipping it. Choose the policy in **Settings → Duplicate Download Policy**:
+
+| Policy | Behavior |
+|---|---|
+| **Skip existing tracks** | Reuse the indexed file and report its path without downloading |
+| **Ask before replacing** | Stop and show the existing path so the policy can be changed explicitly |
+| **Allow duplicates** | Download a separate uniquely named copy |
+| **Replace existing** | Replace the matched file only when this policy is explicitly selected |
+
+Provider search results may include album, playlist, and track-number fields. Playlist or multi-result downloads check each track independently and report downloaded, reused, and failed counts while preserving result order.
 
 ## Development
 
