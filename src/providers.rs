@@ -136,6 +136,37 @@ pub fn installation_commands() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+pub struct ProviderExample {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub provider: Provider,
+}
+
+pub fn examples() -> Vec<ProviderExample> {
+    vec![
+        ProviderExample {
+            name: "yt-dlp + ffmpeg",
+            description: "Search and stream with yt-dlp. Downloads stay disabled until you explicitly mark a result as permitted.",
+            provider: Provider {
+                name: "yt-dlp".to_string(),
+                search_cmd: Some("yt-dlp \"ytsearch10:{query}\" --flat-playlist --print \"%(id)s\\t%(title)s\\t%(uploader)s\\t0\\t%(webpage_url)s\\tfalse\\t%(uploader_url)s\"".to_string()),
+                stream_cmd: Some("yt-dlp --get-url --format bestaudio --no-playlist {url}".to_string()),
+                download_cmd: Some("yt-dlp --extract-audio --audio-format mp3 --output {output_dir}/%(title)s.%(ext)s {url}".to_string()),
+            },
+        },
+        ProviderExample {
+            name: "Generic CLI provider",
+            description: "A template for a tool that supports search, streaming, and downloading.",
+            provider: Provider {
+                name: "My Provider".to_string(),
+                search_cmd: Some("my-provider search --query {query}".to_string()),
+                stream_cmd: Some("my-provider stream --url {url}".to_string()),
+                download_cmd: Some("my-provider download --url {url} --output-dir {output_dir}".to_string()),
+            },
+        },
+    ]
+}
+
 fn write_template(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

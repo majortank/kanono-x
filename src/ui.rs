@@ -128,6 +128,7 @@ pub struct KanonoApp {
     pub provider_stream_cmd_input: String,
     pub provider_download_cmd_input: String,
     pub provider_tool_status: Option<String>,
+    pub provider_example_selection: usize,
 
     // Channels for background tasks
     pub bg_sender: Sender<BgTaskMsg>,
@@ -235,6 +236,7 @@ impl KanonoApp {
             provider_stream_cmd_input: String::new(),
             provider_download_cmd_input: String::new(),
             provider_tool_status: None,
+            provider_example_selection: 0,
 
             bg_sender,
             bg_receiver,
@@ -582,22 +584,15 @@ impl KanonoApp {
     }
 
     fn check_provider_tools(&mut self) {
-        let Some(index) = self.provider_editor_index else {
-            self.provider_tool_status = Some("Select or edit a provider first.".to_string());
-            return;
-        };
-        let Some(provider) = self.providers.get(index) else {
-            self.provider_tool_status = Some("Provider no longer exists.".to_string());
-            return;
-        };
+        let commands = [
+            ("search", self.provider_search_cmd_input.clone()),
+            ("stream", self.provider_stream_cmd_input.clone()),
+            ("download", self.provider_download_cmd_input.clone()),
+        ];
         let mut results = Vec::new();
-        for (label, command) in [
-            ("search", provider.search_cmd.as_deref()),
-            ("stream", provider.stream_cmd.as_deref()),
-            ("download", provider.download_cmd.as_deref()),
-        ] {
-            if let Some(command) = command {
-                match providers::check_command(command) {
+        for (label, command) in commands {
+            if !command.trim().is_empty() {
+                match providers::check_command(&command) {
                     Ok(version) => results.push(format!("{label}: {version}")),
                     Err(error) => results.push(format!("{label}: {error}")),
                 }
@@ -608,6 +603,17 @@ impl KanonoApp {
         } else {
             results.join(" | ")
         });
+    }
+
+    fn load_provider_example(&mut self, index: usize) {
+        if let Some(example) = providers::examples().into_iter().nth(index) {
+            self.provider_editor_index = None;
+            self.provider_name_input = example.provider.name;
+            self.provider_search_cmd_input = example.provider.search_cmd.unwrap_or_default();
+            self.provider_stream_cmd_input = example.provider.stream_cmd.unwrap_or_default();
+            self.provider_download_cmd_input = example.provider.download_cmd.unwrap_or_default();
+            self.provider_tool_status = Some(example.description.to_string());
+        }
     }
 
     pub fn start_discover_search(&mut self) {
@@ -2207,23 +2213,45 @@ impl KanonoApp {
             ui.separator();
             ui.label(RichText::new("Provider definition").strong());
             ui.horizontal(|ui| {
+                ui.label("Start from an example");
+                let examples = providers::examples();
+                let selected_name = examples
+                    .get(self.provider_example_selection)
+                    .map(|example| example.name)
+                    .unwrap_or("Choose an example");
+                egui::ComboBox::from_id_salt("provider_example")
+                    .selected_text(selected_name)
+                    .show_ui(ui, |ui| {
+                        for (index, example) in examples.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.provider_example_selection,
+                                index,
+                                example.name,
+                            );
+                        }
+                    });
+                if ui.button("Load example").clicked() {
+                    self.load_provider_example(self.provider_example_selection);
+                }
+            });
+            ui.label(RichText::new("Choose an example to fill the fields, then replace commands with tools installed on your computer.").color(p.text_muted));
+            ui.horizontal(|ui| {
                 ui.label("Name");
                 ui.add_sized([220.0, 24.0], egui::TextEdit::singleline(&mut self.provider_name_input));
             });
-            ui.label("Search command (prints tab-separated or JSON results)");
+            ui.label("1. Search command — receives {query}; must print one result per line");
             ui.add(egui::TextEdit::singleline(&mut self.provider_search_cmd_input).desired_width(f32::INFINITY));
-            ui.label("Stream command (prints a playable HTTP URL)");
+            ui.label(RichText::new("   Output: id<TAB>title<TAB>artist<TAB>duration<TAB>url<TAB>downloadable<TAB>support_url").small().color(p.text_muted));
+            ui.label("2. Stream command — receives {url}; must print a playable http:// or https:// URL");
             ui.add(egui::TextEdit::singleline(&mut self.provider_stream_cmd_input).desired_width(f32::INFINITY));
-            ui.label("Download command (prints the output path or writes into {output_dir})");
+            ui.label("3. Download command — receives {url} and {output_dir}; writes an audio file there or prints its path");
             ui.add(egui::TextEdit::singleline(&mut self.provider_download_cmd_input).desired_width(f32::INFINITY));
 
             ui.horizontal(|ui| {
                 if ui.button("💾 Save provider").clicked() {
                     self.save_provider_from_editor();
                 }
-                if self.provider_editor_index.is_some()
-                    && ui.button("✓ Check installed tools").clicked()
-                {
+                if ui.button("✓ Check installed tools").clicked() {
                     self.check_provider_tools();
                 }
                 if self.provider_editor_index.is_some() && ui.button("Clear editor").clicked() {
@@ -2233,6 +2261,13 @@ impl KanonoApp {
             if let Some(status) = &self.provider_tool_status {
                 ui.label(RichText::new(status).color(p.accent));
             }
+            ui.collapsing("What do the placeholders mean?", |ui| {
+                ui.monospace("{query}       text entered in the search box");
+                ui.monospace("{url}         URL returned by your search command");
+                ui.monospace("{output_dir}  your configured music library folder");
+                ui.label("Commands are run directly, not through a shell pipeline. Quote placeholders when passing them to a tool that expects one argument.");
+                ui.label("The search output field `downloadable` must be true only when the source explicitly permits downloading.");
+            });
 
             ui.add_space(4.0);
             ui.label(RichText::new("Install common tools").strong());

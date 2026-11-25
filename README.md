@@ -106,6 +106,14 @@ On first launch, Kanono X creates a documented provider template at `~/.config/k
 
 The **Discover / Providers** view includes a provider manager for adding, editing, deleting, reloading, and selecting providers without manually editing TOML. It can check whether configured commands are installed, open the configuration folder, and copy platform-specific installation commands for tools such as `yt-dlp` and `ffmpeg`. Kanono X does not silently install packages or run privileged commands.
 
+For first-time setup, open **Discover / Providers**, choose **Start from an example**, and load the recipe matching the tool you installed. Replace the command fields only when needed, click **Check installed tools**, then save the provider. The form explains that `{query}` is the search text, `{url}` is a result URL, and `{output_dir}` is the music-library folder. Search output must contain tab-separated fields in this order:
+
+```text
+id    title    artist    duration_seconds    url    downloadable    support_url
+```
+
+Set `downloadable` to `true` only when the source explicitly permits downloading; otherwise leave it `false`. Streaming does not require a download command.
+
 ## Development
 
 Format and check the project before opening a change:
