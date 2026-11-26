@@ -90,12 +90,10 @@ cargo run --release -- --tab library
 cargo run --release -- --tab settings --screenshot /tmp/kanono-settings.png
 ```
 
-## System-wide installation
+## Install Kanono X
 
-The repository includes desktop integration for launchers, dock pinning, tray
-controls, and login startup. Each user's library and settings remain in their
-home directory; installation only places the executable and desktop resources
-system-wide.
+Kanono X is a desktop music player and library manager. Install it using the
+method that matches your Linux distribution:
 
 For Arch Linux or Omarchy:
 
@@ -110,11 +108,8 @@ For another Linux distribution:
 sudo ./install.sh
 ```
 
-The `.desktop` file makes Kanono X appear in the application launcher and
-allows it to be pinned to the dock by the desktop environment. The tray menu
-provides show/hide, play/pause, previous, next, and quit actions. Autostart
-launches Kanono X hidden with its tray controls; disable it in the desktop
-environment's startup settings if needed.
+After installation, launch Kanono X from your applications menu or run
+`kanono-x` from a terminal.
 
 ## Local data
 
