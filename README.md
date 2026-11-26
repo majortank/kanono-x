@@ -14,14 +14,13 @@
 - **Local playback** with play/pause, seeking, volume, mute, track navigation, and a 32-band visualizer.
 - **Foobar-style library navigation** with a hierarchical folder tree, breadcrumbs, expandable folders, and an include-subfolders toggle.
 - **Fast filtering and sorting** across title, artist, album, filename, and folder path.
-- **SQLite catalog** using WAL mode, indexed metadata queries, play counts, rescan support, and maintenance tools.
+- **Library management** with folder navigation, search, sorting, play history, and duplicate protection.
 - **Library-aware duplicate protection** with persistent matching by MusicBrainz recording ID, ISRC, optional `fpcalc` fingerprint, and conservative normalized metadata/duration checks.
 - **Organized downloads** stored as `Artist/Album/track.ext`; tracks without album metadata use `Artist/Singles` instead of an `Unknown Album` folder.
 - **Eight visual themes:** CRT Green, CRT Amber, CRT Cyber Cyan, Omarchy Emerald, Cyberpunk, Nord, Dracula, and Solarized.
 - **Legal discovery and streaming** through the public Audius API, with downloads gated by the artist's `is_downloadable` flag.
-- **Generic external providers** loaded from `~/.config/kanono-x/providers.toml`; no media service is hardcoded into the core.
+- **Optional external providers** for additional music sources.
 - **Artist support links** extracted from Audius profiles and local audio tags and opened in the system browser.
-- **Headless screenshot mode** for UI checks and automated visual capture.
 
 ### Supported audio formats
 
@@ -70,26 +69,6 @@ cargo run --release
 
 The application scans `~/Music` by default when it exists. Add additional folders from the **Library** tab. If no audio directory exists, downloaded audio falls back to the application's local data directory.
 
-### Command-line options
-
-```text
---tab <nowplaying|library|discover|providers|settings>
-    Open a specific tab at startup.
-
---screenshot <path.png>
-    Run in inactive/headless capture mode and save a screenshot.
-
---start-hidden
-    Start without showing the main window; use the tray menu to restore it.
-```
-
-Examples:
-
-```bash
-cargo run --release -- --tab library
-cargo run --release -- --tab settings --screenshot /tmp/kanono-settings.png
-```
-
 ## Install Kanono X
 
 Kanono X is a desktop music player and library manager. Install it using the
@@ -110,21 +89,6 @@ sudo ./install.sh
 
 After installation, launch Kanono X from your applications menu or run
 `kanono-x` from a terminal.
-
-## Local data
-
-Kanono X currently stores its runtime data relative to the directory from which it is launched:
-
-| Path | Purpose |
-|---|---|
-| `~/.local/share/kanono-x/kanono_x_library.db` | SQLite library catalog |
-| `~/.local/share/kanono-x/kanono_x_library.db-wal` / `.db-shm` | SQLite WAL sidecar files |
-| `~/.local/share/kanono-x/library_cache.json` | Cached local track metadata |
-| `~/.local/share/kanono-x/library_state.json` | Saved library folders and files |
-| `~/.config/kanono-x/providers.toml` | User-defined external provider commands |
-| `~/Music` | Default music directory when present |
-
-Do not commit personal music, generated databases, or cache files. The repository `.gitignore` already excludes these paths.
 
 ## Legal streaming and external providers
 
