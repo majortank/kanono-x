@@ -32,4 +32,5 @@ rfd = "0.18"
 rusqlite = { version = "0.32", features = ["bundled"] }
 shell-words = "1"
 toml = "0.9"
+tray-icon = "0.21"
 unicode-normalization = "0.1"

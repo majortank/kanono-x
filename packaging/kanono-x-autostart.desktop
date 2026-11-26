@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Kanono X
+Comment=Start Kanono X hidden with its tray controls
+Exec=kanono-x --start-hidden
+Icon=kanono-x
+Terminal=false
+X-GNOME-Autostart-enabled=true

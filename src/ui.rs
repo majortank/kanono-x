@@ -10,6 +10,7 @@ use crate::library::{format_time, scan_directory, Track};
 use crate::library_db::{DbStats, DownloadDisposition, DownloadResult, DuplicatePolicy, LibraryDb};
 use crate::providers::{self, Provider, ProviderItem};
 use crate::theme::{PlayerTheme, ThemePalette};
+use crate::tray::{TrayAction, TrayController};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ViewTab {
@@ -148,10 +149,11 @@ pub struct KanonoApp {
 
     // Notification toast
     pub toast_message: Option<(String, f32)>,
+    pub tray: Option<TrayController>,
 }
 
 impl KanonoApp {
-    pub fn new(screenshot_path: Option<String>) -> Self {
+    pub fn new(screenshot_path: Option<String>, tray: Option<TrayController>) -> Self {
         let library_dir = crate::library::ensure_library_dir();
         let (bg_sender, bg_receiver) = channel();
         let (providers, provider_config_error) = match providers::load_configured_providers() {
@@ -252,6 +254,7 @@ impl KanonoApp {
             frame_count: 0,
             screenshot_sent: false,
             toast_message: None,
+            tray,
         };
 
         app.rebuild_folder_tree();
@@ -860,6 +863,24 @@ impl eframe::App for KanonoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count += 1;
         self.process_bg_messages();
+
+        let tray_action = self.tray.as_ref().and_then(TrayController::action);
+        if let Some(action) = tray_action {
+            match action {
+                TrayAction::ShowHide => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::PlayPause => self.audio.toggle_play_pause(),
+                TrayAction::Previous => self.play_previous(),
+                TrayAction::Next => self.play_next(),
+                TrayAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
+        }
+        if let Some(tray) = &self.tray {
+            crate::tray::update_tooltip(tray, &self.audio);
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
 
         // Apply theme styling dynamically when changed
         if self.last_theme_applied != Some(self.current_theme) {

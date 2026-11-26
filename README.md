@@ -49,13 +49,14 @@ The library scanner recognizes MP3, WAV, FLAC, OGG, M4A, AAC, and Opus files. Ac
 
 ```bash
 sudo apt install build-essential pkg-config libasound2-dev
+sudo apt install libgtk-3-dev libappindicator3-dev libxdo-dev
 sudo apt install ffmpeg  # optional provider dependency
 ```
 
 ### Arch Linux
 
 ```bash
-sudo pacman -S base-devel pkgconf alsa-lib
+sudo pacman -S base-devel pkgconf alsa-lib gtk3 libappindicator-gtk3 xdotool
 sudo pacman -S ffmpeg  # optional provider dependency
 ```
 
@@ -77,6 +78,9 @@ The application scans `~/Music` by default when it exists. Add additional folder
 
 --screenshot <path.png>
     Run in inactive/headless capture mode and save a screenshot.
+
+--start-hidden
+    Start without showing the main window; use the tray menu to restore it.
 ```
 
 Examples:
@@ -85,6 +89,32 @@ Examples:
 cargo run --release -- --tab library
 cargo run --release -- --tab settings --screenshot /tmp/kanono-settings.png
 ```
+
+## System-wide installation
+
+The repository includes desktop integration for launchers, dock pinning, tray
+controls, and login startup. Each user's library and settings remain in their
+home directory; installation only places the executable and desktop resources
+system-wide.
+
+For Arch Linux or Omarchy:
+
+```bash
+cd packaging
+makepkg -fsi
+```
+
+For another Linux distribution:
+
+```bash
+sudo ./install.sh
+```
+
+The `.desktop` file makes Kanono X appear in the application launcher and
+allows it to be pinned to the dock by the desktop environment. The tray menu
+provides show/hide, play/pause, previous, next, and quit actions. Autostart
+launches Kanono X hidden with its tray controls; disable it in the desktop
+environment's startup settings if needed.
 
 ## Local data
 

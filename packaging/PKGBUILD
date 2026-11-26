@@ -1,0 +1,28 @@
+pkgname=kanono-x
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Advanced Hi-Fi audio player and local music library manager'
+arch=('x86_64')
+url='https://github.com/majortank/kanono-x'
+license=('MIT')
+depends=('alsa-lib' 'gtk3' 'libappindicator-gtk3' 'xdotool')
+makedepends=('cargo' 'git')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/majortank/kanono-x/archive/refs/heads/main.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/kanono-x-main"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$srcdir/kanono-x-main"
+  install -Dm755 target/release/kanono-x "$pkgdir/usr/bin/kanono-x"
+  install -Dm644 resources/icons/kanono-x.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/kanono-x.svg"
+  install -Dm644 packaging/kanono-x.desktop \
+    "$pkgdir/usr/share/applications/kanono-x.desktop"
+  install -Dm644 packaging/kanono-x-autostart.desktop \
+    "$pkgdir/usr/share/xdg/autostart/kanono-x.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

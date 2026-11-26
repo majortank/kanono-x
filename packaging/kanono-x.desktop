@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Kanono X
+Comment=Advanced Hi-Fi audio player and library manager
+Exec=kanono-x
+Icon=kanono-x
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true
+StartupWMClass=kanono-x
+Keywords=music;audio;player;library;
